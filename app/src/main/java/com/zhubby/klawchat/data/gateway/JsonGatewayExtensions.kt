@@ -37,23 +37,43 @@ inline fun <reified T> JsonElement.decodeAs(): T = GatewayJson.decodeFromJsonEle
 fun JsonObject.chatMessage(fallbackSessionKey: String? = null): ChatMessage? {
     val response = this["response"]?.objectOrNull()
     val message = this["message"]?.objectOrNull()
+    val messageResponse = message?.get("response")?.objectOrNull()
     val sessionKey = string("session_key")
         ?: response?.string("session_key")
         ?: message?.string("session_key")
+        ?: messageResponse?.string("session_key")
         ?: fallbackSessionKey
         ?: return null
-    val role = string("role") ?: response?.string("role") ?: message?.string("role") ?: "assistant"
-    val content = string("content") ?: response?.string("content") ?: message?.string("content").orEmpty()
+    val role = string("role")
+        ?: response?.string("role")
+        ?: message?.string("role")
+        ?: messageResponse?.string("role")
+        ?: "assistant"
+    val content = string("content")
+        ?: response?.string("content")
+        ?: message?.string("content")
+        ?: messageResponse?.string("content")
+        ?: ""
     if (content.isBlank() && response == null && message == null) return null
-    val requestId = string("request_id") ?: response?.string("request_id") ?: message?.string("request_id")
+    val requestId = string("request_id")
+        ?: response?.string("request_id")
+        ?: message?.string("request_id")
+        ?: messageResponse?.string("request_id")
     val timestampMs = string("timestamp_ms")?.toLongOrNull()
         ?: response?.string("timestamp_ms")?.toLongOrNull()
         ?: message?.string("timestamp_ms")?.toLongOrNull()
+        ?: messageResponse?.string("timestamp_ms")?.toLongOrNull()
     val messageId = string("message_id")
         ?: response?.string("message_id")
         ?: message?.string("message_id")
+        ?: messageResponse?.string("message_id")
         ?: "local:${UUID.randomUUID()}"
-    val attachments = (this["attachments"] ?: response?.get("attachments") ?: message?.get("attachments"))?.let { element ->
+    val attachments = (
+        this["attachments"]
+            ?: response?.get("attachments")
+            ?: message?.get("attachments")
+            ?: messageResponse?.get("attachments")
+        )?.let { element ->
         runCatching { GatewayJson.decodeFromJsonElement<List<ArchiveAttachment>>(element) }.getOrDefault(emptyList())
     }.orEmpty()
     return ChatMessage(

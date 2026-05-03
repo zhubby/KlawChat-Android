@@ -95,6 +95,33 @@ class GatewayFrameTest {
     }
 
     @Test
+    fun parsesWrappedAssistantMessageResponsePayload() {
+        val payload = json.parseToJsonElement(
+            """
+            {
+              "message": {
+                "session_key": "session-1",
+                "message_id": "assistant-1",
+                "role": "assistant",
+                "response": {
+                  "content": "wrapped assistant response",
+                  "attachments": [
+                    { "archive_id": "archive-1", "filename": "assistant.txt" }
+                  ]
+                }
+              }
+            }
+            """.trimIndent(),
+        ).jsonObject
+
+        val message = payload.chatMessage()
+
+        assertEquals("assistant", message?.role)
+        assertEquals("wrapped assistant response", message?.content)
+        assertEquals("assistant.txt", message?.attachments?.single()?.filename)
+    }
+
+    @Test
     fun parsesHistoryMessagesResultFromGateway() {
         val result = json.parseToJsonElement(
             """
@@ -119,6 +146,61 @@ class GatewayFrameTest {
         assertEquals("older message", history.messages.single().content)
         assertEquals(true, history.hasMore)
         assertEquals("message-1", history.oldestLoadedMessageId)
+    }
+
+    @Test
+    fun parsesAssistantHistoryMessagesFromGatewayPage() {
+        val result = json.parseToJsonElement(
+            """
+            {
+              "session_key": "session-1",
+              "messages": [
+                {
+                  "role": "assistant",
+                  "content": "previous answer",
+                  "timestamp_ms": 42,
+                  "metadata": {},
+                  "message_id": "msg-2"
+                }
+              ],
+              "has_more": false,
+              "oldest_loaded_message_id": "msg-2"
+            }
+            """.trimIndent(),
+        ).jsonObject
+
+        val history = result.historyResult()
+        val message = history.messages.single()
+
+        assertEquals("msg-2", message.id)
+        assertEquals("session-1", message.sessionKey)
+        assertEquals("assistant", message.role)
+        assertEquals("previous answer", message.content)
+        assertEquals(42L, message.timestampMs)
+    }
+
+    @Test
+    fun parsesAssistantHistoryMessagesWithResponseContent() {
+        val result = json.parseToJsonElement(
+            """
+            {
+              "session_key": "session-1",
+              "messages": [
+                {
+                  "role": "assistant",
+                  "response": { "content": "previous response answer" },
+                  "timestamp_ms": 42,
+                  "message_id": "msg-2"
+                }
+              ]
+            }
+            """.trimIndent(),
+        ).jsonObject
+
+        val message = result.historyResult().messages.single()
+
+        assertEquals("assistant", message.role)
+        assertEquals("previous response answer", message.content)
     }
 
     @Test

@@ -66,6 +66,12 @@ object ChatStateReducer {
         requestId: String,
         content: String,
     ): ChatUiState {
+        val hasSnapshotMessage = state.messagesBySession[sessionKey].orEmpty().any { message ->
+            message.role.equals("assistant", ignoreCase = true) && message.requestId == requestId
+        }
+        if (hasSnapshotMessage) {
+            return state
+        }
         val streamKey = state.streamingMessages.values
             .firstOrNull { it.sessionKey == sessionKey }
             ?.requestId
@@ -81,7 +87,14 @@ object ChatStateReducer {
 
     fun reduceMessage(state: ChatUiState, message: ChatMessage): ChatUiState {
         val currentMessages = state.messagesBySession[message.sessionKey].orEmpty()
-        val withoutDuplicate = currentMessages.filterNot { it.id == message.id }
+        val withoutDuplicate = currentMessages.filterNot { existing ->
+            existing.id == message.id || (
+                message.role.equals("assistant", ignoreCase = true) &&
+                    message.requestId != null &&
+                    existing.role.equals("assistant", ignoreCase = true) &&
+                    existing.requestId == message.requestId
+                )
+        }
         val nextMessages = withoutDuplicate + message
         val requestId = message.requestId
         val nextStreaming = if (requestId == null || state.streamingMessages.values.any { it.sessionKey == message.sessionKey }) {

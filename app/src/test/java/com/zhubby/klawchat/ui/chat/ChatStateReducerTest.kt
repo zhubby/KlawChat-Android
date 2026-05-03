@@ -87,6 +87,57 @@ class ChatStateReducerTest {
     }
 
     @Test
+    fun assistantSnapshotsWithSameRequestIdUpdateOneBubble() {
+        val state = ChatUiState(selectedSessionKey = "session-1")
+        val first = ChatMessage(
+            id = "local:first",
+            sessionKey = "session-1",
+            role = "assistant",
+            content = "hel",
+            requestId = "request-1",
+        )
+        val second = ChatMessage(
+            id = "local:second",
+            sessionKey = "session-1",
+            role = "assistant",
+            content = "hello",
+            requestId = "request-1",
+        )
+
+        val updated = ChatStateReducer.reduceMessage(
+            ChatStateReducer.reduceMessage(state, first),
+            second,
+        )
+
+        assertEquals(listOf(second), updated.messagesBySession["session-1"])
+    }
+
+    @Test
+    fun streamDeltaDoesNotCreateSeparateBubbleWhenSnapshotMessageExists() {
+        val snapshot = ChatMessage(
+            id = "local:snapshot",
+            sessionKey = "session-1",
+            role = "assistant",
+            content = "hello",
+            requestId = "request-1",
+        )
+        val state = ChatUiState(
+            selectedSessionKey = "session-1",
+            messagesBySession = mapOf("session-1" to listOf(snapshot)),
+        )
+
+        val updated = ChatStateReducer.reduceStreamDelta(
+            state = state,
+            sessionKey = "session-1",
+            requestId = "request-1",
+            content = "hello",
+        )
+
+        assertEquals(emptyMap<String, StreamingMessage>(), updated.streamingMessages)
+        assertEquals(listOf(snapshot), updated.messagesBySession["session-1"])
+    }
+
+    @Test
     fun completedMessageClearsSessionStreamWhenRequestIdChangedDuringStreaming() {
         val state = ChatUiState(
             selectedSessionKey = "session-1",
