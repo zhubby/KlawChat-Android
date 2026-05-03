@@ -1,7 +1,6 @@
 package com.zhubby.klawchat.data.gateway
 
 import kotlinx.coroutines.flow.SharedFlow
-import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.encodeToJsonElement
@@ -100,24 +99,18 @@ class ChatRepository(
                 put("before_message_id", nullableString(beforeMessageId))
             },
         ).jsonObject
-        val history = result.objectList("history").mapNotNull(JsonObject::chatMessage)
-        return HistoryResult(
-            messages = history,
-            hasMore = result.boolean("has_more") ?: false,
-            oldestLoadedMessageId = result.string("oldest_loaded_message_id"),
-        )
+        return result.historyResult()
     }
 
-    fun submit(
+    suspend fun submit(
         sessionKey: String,
         input: String,
         stream: Boolean,
         modelProvider: String?,
         model: String?,
         attachments: List<ArchiveAttachment> = emptyList(),
-    ): String = wsClient.send(
-        method = "session.submit",
-        params = buildJsonObject {
+    ): ChatMessage? {
+        val params = buildJsonObject {
             put("session_key", sessionKey)
             put("chat_id", sessionKey)
             put("input", input)
@@ -128,8 +121,16 @@ class ChatRepository(
                 put("attachments", GatewayJson.encodeToJsonElement(attachments))
                 put("archive_id", attachments.first().archiveId)
             }
-        },
-    )
+        }
+        return if (stream) {
+            wsClient.send(method = "session.submit", params = params)
+            null
+        } else {
+            wsClient.sendAndWaitResult(method = "session.submit", params = params)
+                .jsonObject
+                .chatMessage(fallbackSessionKey = sessionKey)
+        }
+    }
 
     override fun close() {
         wsClient.close()

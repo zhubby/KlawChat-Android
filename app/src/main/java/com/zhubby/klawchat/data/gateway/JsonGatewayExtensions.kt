@@ -12,6 +12,7 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.serializer
+import java.util.UUID
 
 fun String.asJson() = JsonPrimitive(this)
 
@@ -25,7 +26,7 @@ fun nullableString(value: String?): JsonElement = value?.let(::JsonPrimitive) ?:
 
 fun JsonElement.objectOrNull(): JsonObject? = this as? JsonObject
 
-fun JsonObject.string(name: String): String? = this[name]?.jsonPrimitive?.contentOrNull
+fun JsonObject.string(name: String): String? = (this[name] as? JsonPrimitive)?.contentOrNull
 
 fun JsonObject.boolean(name: String): Boolean? = this[name]?.jsonPrimitive?.booleanOrNull
 
@@ -33,19 +34,25 @@ fun JsonObject.array(name: String): JsonArray? = this[name] as? JsonArray
 
 inline fun <reified T> JsonElement.decodeAs(): T = GatewayJson.decodeFromJsonElement(serializer(), this)
 
-fun JsonObject.chatMessage(): ChatMessage? {
+fun JsonObject.chatMessage(fallbackSessionKey: String? = null): ChatMessage? {
     val response = this["response"]?.objectOrNull()
     val message = this["message"]?.objectOrNull()
-    val messageId = string("message_id")
-        ?: response?.string("message_id")
-        ?: message?.string("message_id")
-        ?: return null
     val sessionKey = string("session_key")
         ?: response?.string("session_key")
         ?: message?.string("session_key")
+        ?: fallbackSessionKey
         ?: return null
     val role = string("role") ?: response?.string("role") ?: message?.string("role") ?: "assistant"
     val content = string("content") ?: response?.string("content") ?: message?.string("content").orEmpty()
+    if (content.isBlank() && response == null && message == null) return null
+    val requestId = string("request_id") ?: response?.string("request_id") ?: message?.string("request_id")
+    val timestampMs = string("timestamp_ms")?.toLongOrNull()
+        ?: response?.string("timestamp_ms")?.toLongOrNull()
+        ?: message?.string("timestamp_ms")?.toLongOrNull()
+    val messageId = string("message_id")
+        ?: response?.string("message_id")
+        ?: message?.string("message_id")
+        ?: "local:${UUID.randomUUID()}"
     val attachments = (this["attachments"] ?: response?.get("attachments") ?: message?.get("attachments"))?.let { element ->
         runCatching { GatewayJson.decodeFromJsonElement<List<ArchiveAttachment>>(element) }.getOrDefault(emptyList())
     }.orEmpty()
@@ -54,13 +61,37 @@ fun JsonObject.chatMessage(): ChatMessage? {
         sessionKey = sessionKey,
         role = role,
         content = content,
-        timestampMs = string("timestamp_ms")?.toLongOrNull()
-            ?: response?.string("timestamp_ms")?.toLongOrNull()
-            ?: message?.string("timestamp_ms")?.toLongOrNull(),
-        requestId = string("request_id") ?: response?.string("request_id") ?: message?.string("request_id"),
+        timestampMs = timestampMs,
+        requestId = requestId,
         attachments = attachments,
     )
 }
 
 fun JsonElement.objectList(name: String): List<JsonObject> =
     objectOrNull()?.array(name)?.mapNotNull { it.objectOrNull() }.orEmpty()
+
+fun JsonObject.historyResult(): HistoryResult {
+    val sessionKey = string("session_key")
+    val messages = (array("messages") ?: array("history"))
+        ?.mapNotNull { it.objectOrNull()?.chatMessage(fallbackSessionKey = sessionKey) }
+        .orEmpty()
+    return HistoryResult(
+        messages = messages,
+        hasMore = boolean("has_more") ?: false,
+        oldestLoadedMessageId = string("oldest_loaded_message_id"),
+    )
+}
+
+fun JsonObject.streamDeltaText(): String {
+    val delta = this["delta"]?.objectOrNull()
+    val response = this["response"]?.objectOrNull()
+    val message = this["message"]?.objectOrNull()
+    return string("delta")
+        ?: delta?.string("content")
+        ?: delta?.string("text")
+        ?: string("content")
+        ?: string("text")
+        ?: response?.string("content")
+        ?: message?.string("content")
+        ?: ""
+}

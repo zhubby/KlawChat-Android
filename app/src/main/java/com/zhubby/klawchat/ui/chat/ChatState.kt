@@ -4,6 +4,7 @@ import com.zhubby.klawchat.data.gateway.ChatMessage
 import com.zhubby.klawchat.data.gateway.ArchiveAttachment
 import com.zhubby.klawchat.data.gateway.Provider
 import com.zhubby.klawchat.data.gateway.WorkspaceSession
+import java.util.UUID
 
 enum class ConnectionStatus {
     Disconnected,
@@ -39,19 +40,43 @@ data class ChatUiState(
 }
 
 object ChatStateReducer {
+    fun reduceLocalUserMessage(
+        state: ChatUiState,
+        sessionKey: String,
+        content: String,
+        attachments: List<ArchiveAttachment>,
+        nowMs: Long = System.currentTimeMillis(),
+    ): ChatUiState {
+        return reduceMessage(
+            state = state,
+            message = ChatMessage(
+                id = "local:user:${UUID.randomUUID()}",
+                sessionKey = sessionKey,
+                role = "user",
+                content = content,
+                timestampMs = nowMs,
+                attachments = attachments,
+            ),
+        )
+    }
+
     fun reduceStreamDelta(
         state: ChatUiState,
         sessionKey: String,
         requestId: String,
         content: String,
     ): ChatUiState {
-        val existing = state.streamingMessages[requestId]
+        val streamKey = state.streamingMessages.values
+            .firstOrNull { it.sessionKey == sessionKey }
+            ?.requestId
+            ?: requestId
+        val existing = state.streamingMessages[streamKey]
         val next = StreamingMessage(
             sessionKey = sessionKey,
-            requestId = requestId,
+            requestId = streamKey,
             content = (existing?.content.orEmpty() + content),
         )
-        return state.copy(streamingMessages = state.streamingMessages + (requestId to next))
+        return state.copy(streamingMessages = state.streamingMessages + (streamKey to next))
     }
 
     fun reduceMessage(state: ChatUiState, message: ChatMessage): ChatUiState {
@@ -59,14 +84,40 @@ object ChatStateReducer {
         val withoutDuplicate = currentMessages.filterNot { it.id == message.id }
         val nextMessages = withoutDuplicate + message
         val requestId = message.requestId
-        val nextStreaming = if (requestId == null) {
-            state.streamingMessages
+        val nextStreaming = if (requestId == null || state.streamingMessages.values.any { it.sessionKey == message.sessionKey }) {
+            state.streamingMessages.filterValues { it.sessionKey != message.sessionKey }
         } else {
             state.streamingMessages - requestId
         }
         return state.copy(
             messagesBySession = state.messagesBySession + (message.sessionKey to nextMessages),
             streamingMessages = nextStreaming,
+        )
+    }
+
+    fun reduceStreamClear(
+        state: ChatUiState,
+        sessionKey: String?,
+        requestId: String?,
+    ): ChatUiState {
+        val nextStreaming = state.streamingMessages.filter { (key, stream) ->
+            key != requestId && (sessionKey == null || stream.sessionKey != sessionKey)
+        }
+        return state.copy(streamingMessages = nextStreaming)
+    }
+
+    fun reduceHistory(
+        state: ChatUiState,
+        sessionKey: String,
+        history: List<ChatMessage>,
+    ): ChatUiState {
+        val current = state.messagesBySession[sessionKey].orEmpty()
+        val seenIds = current.map { it.id }.toMutableSet()
+        val newHistory = history.filter { message ->
+            seenIds.add(message.id)
+        }
+        return state.copy(
+            messagesBySession = state.messagesBySession + (sessionKey to (newHistory + current)),
         )
     }
 }

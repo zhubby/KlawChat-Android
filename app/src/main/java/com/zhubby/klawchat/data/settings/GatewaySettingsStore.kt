@@ -9,7 +9,8 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 
 private val Context.gatewaySettingsDataStore by preferencesDataStore("gateway_settings")
-private const val DEFAULT_GATEWAY_BASE_URL = "http://10.0.2.2:3000"
+private const val DEFAULT_GATEWAY_BASE_URL = "http://192.168.11.91:3000"
+private const val LEGACY_EMULATOR_BASE_URL = "http://10.0.2.2:3000"
 
 data class GatewaySettings(
     val baseUrl: String = DEFAULT_GATEWAY_BASE_URL,
@@ -21,7 +22,9 @@ data class GatewaySettings(
 class GatewaySettingsStore(private val context: Context) {
     val settings: Flow<GatewaySettings> = context.gatewaySettingsDataStore.data.map { preferences ->
         GatewaySettings(
-            baseUrl = preferences[BASE_URL] ?: DEFAULT_GATEWAY_BASE_URL,
+            baseUrl = preferences[BASE_URL]
+                ?.takeUnless { it == LEGACY_EMULATOR_BASE_URL }
+                ?: DEFAULT_GATEWAY_BASE_URL,
             token = preferences[TOKEN].orEmpty(),
             streamEnabled = preferences[STREAM_ENABLED] ?: true,
             lastSessionKey = preferences[LAST_SESSION_KEY],

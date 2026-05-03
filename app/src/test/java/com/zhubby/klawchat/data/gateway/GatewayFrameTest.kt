@@ -93,4 +93,122 @@ class GatewayFrameTest {
         assertEquals("wrapped", message?.content)
         assertEquals("wrapped.txt", message?.attachments?.single()?.filename)
     }
+
+    @Test
+    fun parsesHistoryMessagesResultFromGateway() {
+        val result = json.parseToJsonElement(
+            """
+            {
+              "session_key": "session-1",
+              "messages": [
+                {
+                  "message_id": "message-1",
+                  "role": "user",
+                  "content": "older message",
+                  "timestamp_ms": 123
+                }
+              ],
+              "has_more": true,
+              "oldest_loaded_message_id": "message-1"
+            }
+            """.trimIndent(),
+        ).jsonObject
+
+        val history = result.historyResult()
+
+        assertEquals("older message", history.messages.single().content)
+        assertEquals(true, history.hasMore)
+        assertEquals("message-1", history.oldestLoadedMessageId)
+    }
+
+    @Test
+    fun readsStreamDeltaFromGatewayDeltaField() {
+        val payload = json.parseToJsonElement(
+            """{"session_key":"session-1","request_id":"request-1","delta":"hello"}""",
+        ).jsonObject
+
+        assertEquals("hello", payload.streamDeltaText())
+    }
+
+    @Test
+    fun readsStreamDeltaFromNestedGatewayDeltaContent() {
+        val payload = json.parseToJsonElement(
+            """{"session_key":"session-1","request_id":"request-1","delta":{"content":"hello"}}""",
+        ).jsonObject
+
+        assertEquals("hello", payload.streamDeltaText())
+    }
+
+    @Test
+    fun readsStreamDeltaFromTextField() {
+        val payload = json.parseToJsonElement(
+            """{"session_key":"session-1","request_id":"request-1","text":"hello"}""",
+        ).jsonObject
+
+        assertEquals("hello", payload.streamDeltaText())
+    }
+
+    @Test
+    fun parsesSubmitResultResponseAsAssistantMessage() {
+        val result = json.parseToJsonElement(
+            """
+            {
+              "session_key": "session-1",
+              "message_id": "assistant-1",
+              "request_id": "request-1",
+              "response": {
+                "content": "assistant reply"
+              },
+              "timestamp_ms": 1234
+            }
+            """.trimIndent(),
+        ).jsonObject
+
+        val message = result.chatMessage()
+
+        assertEquals("assistant", message?.role)
+        assertEquals("assistant reply", message?.content)
+        assertEquals("request-1", message?.requestId)
+    }
+
+    @Test
+    fun parsesAssistantResponseWithoutMessageId() {
+        val result = json.parseToJsonElement(
+            """
+            {
+              "session_key": "session-1",
+              "response": {
+                "content": "assistant reply without id"
+              }
+            }
+            """.trimIndent(),
+        ).jsonObject
+
+        val message = result.chatMessage()
+
+        assertEquals("assistant", message?.role)
+        assertEquals("assistant reply without id", message?.content)
+        assertEquals("session-1", message?.sessionKey)
+    }
+
+    @Test
+    fun generatedAssistantIdsAreUniqueWithoutMessageId() {
+        val result = json.parseToJsonElement(
+            """
+            {
+              "session_key": "session-1",
+              "response": {
+                "content": "same reply"
+              }
+            }
+            """.trimIndent(),
+        ).jsonObject
+
+        val first = result.chatMessage()
+        val second = result.chatMessage()
+
+        assert(first != null)
+        assert(second != null)
+        assert(first?.id != second?.id)
+    }
 }

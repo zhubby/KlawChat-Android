@@ -55,6 +55,11 @@ class GatewayWsClient(
         _connectionStates.tryEmit(GatewayConnectionState.Connecting)
         val request = Request.Builder()
             .url(endpoint.webSocketUrl)
+            .apply {
+                if (endpoint.token.isNotBlank()) {
+                    header("Authorization", "Bearer ${endpoint.token}")
+                }
+            }
             .build()
         webSocket = okHttpClient.newWebSocket(request, listener)
     }

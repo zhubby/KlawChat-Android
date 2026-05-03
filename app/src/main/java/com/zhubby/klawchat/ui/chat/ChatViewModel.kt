@@ -2,6 +2,7 @@ package com.zhubby.klawchat.ui.chat
 
 import android.app.Application
 import android.net.Uri
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.zhubby.klawchat.data.gateway.ArchiveApi
@@ -13,6 +14,7 @@ import com.zhubby.klawchat.data.gateway.GatewayServerFrame
 import com.zhubby.klawchat.data.gateway.GatewayWsClient
 import com.zhubby.klawchat.data.gateway.chatMessage
 import com.zhubby.klawchat.data.gateway.string
+import com.zhubby.klawchat.data.gateway.streamDeltaText
 import com.zhubby.klawchat.data.settings.GatewaySettings
 import com.zhubby.klawchat.data.settings.GatewaySettingsStore
 import kotlinx.coroutines.Dispatchers
@@ -71,7 +73,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
         viewModelScope.launch {
-            repository.events.collect(::handleEvent)
+            repository.events.collect { event ->
+                runCatching { handleEvent(event) }
+                    .onFailure { error ->
+                        Log.w("KlawChatGateway", "Failed to handle ${event.event}", error)
+                        _uiState.update { it.copy(statusMessage = error.message ?: "Failed to handle gateway event") }
+                    }
+            }
         }
     }
 
@@ -131,7 +139,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 repository.subscribe(sessionKey)
                 val history = repository.loadHistory(sessionKey)
                 _uiState.update { state ->
-                    state.copy(messagesBySession = state.messagesBySession + (sessionKey to history.messages))
+                    ChatStateReducer.reduceHistory(state, sessionKey, history.messages)
                 }
             }.onFailure { error ->
                 _uiState.update { it.copy(statusMessage = error.message ?: "Failed to load history") }
@@ -146,14 +154,26 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         if (trimmed.isEmpty() && selectedAttachments.isEmpty()) return
         viewModelScope.launch {
             runCatching {
-                repository.submit(
+                val displayContent = trimmed.ifEmpty { "Attachment" }
+                _uiState.update {
+                    ChatStateReducer.reduceLocalUserMessage(
+                        state = it,
+                        sessionKey = session.sessionKey,
+                        content = displayContent,
+                        attachments = selectedAttachments,
+                    )
+                }
+                val response = repository.submit(
                     sessionKey = session.sessionKey,
-                    input = trimmed.ifEmpty { "Attachment" },
+                    input = displayContent,
                     stream = currentSettings.streamEnabled,
                     modelProvider = session.modelProvider,
                     model = session.model,
                     attachments = selectedAttachments,
                 )
+                response?.let { message ->
+                    _uiState.update { ChatStateReducer.reduceMessage(it, message) }
+                }
                 _uiState.update { it.copy(pendingAttachments = emptyList()) }
             }.onFailure { error ->
                 _uiState.update { it.copy(statusMessage = error.message ?: "Failed to submit") }
@@ -215,7 +235,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     repository.subscribe(nextSelected!!)
                     val history = repository.loadHistory(nextSelected!!)
                     _uiState.update { state ->
-                        state.copy(messagesBySession = state.messagesBySession + (nextSelected!! to history.messages))
+                        ChatStateReducer.reduceHistory(state, nextSelected!!, history.messages)
                     }
                 }
             }
@@ -260,26 +280,53 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private fun handleEvent(event: GatewayServerFrame.Event) {
         val payload = JsonObject(event.payload)
         when (event.event) {
-            "session.message" -> payload.chatMessage()?.let { message ->
-                _uiState.update { ChatStateReducer.reduceMessage(it, message) }
+            "session.message" -> {
+                val message = payload.chatMessage()
+                logParsedMessage(event.event, payload, message)
+                message?.let {
+                    _uiState.update { state -> ChatStateReducer.reduceMessage(state, it) }
+                }
             }
             "session.stream.delta" -> {
                 val sessionKey = payload.string("session_key") ?: uiState.value.selectedSessionKey
-                val requestId = payload.string("request_id")
-                val content = payload.string("content").orEmpty()
+                val requestId = payload.string("request_id") ?: sessionKey
+                val content = payload.streamDeltaText()
                 if (sessionKey != null && requestId != null) {
                     _uiState.update { ChatStateReducer.reduceStreamDelta(it, sessionKey, requestId, content) }
                 }
             }
-            "session.stream.clear", "session.stream.done" -> {
+            "session.stream.clear" -> {
+                val sessionKey = payload.string("session_key") ?: uiState.value.selectedSessionKey
                 val requestId = payload.string("request_id")
-                if (requestId != null) {
+                _uiState.update { state ->
+                    ChatStateReducer.reduceStreamClear(state, sessionKey, requestId)
+                }
+            }
+            "session.stream.done" -> {
+                val message = payload.chatMessage()
+                logParsedMessage(event.event, payload, message)
+                if (message != null) {
+                    _uiState.update { ChatStateReducer.reduceMessage(it, message) }
+                } else {
+                    val sessionKey = payload.string("session_key") ?: uiState.value.selectedSessionKey
+                    val requestId = payload.string("request_id")
                     _uiState.update { state ->
-                        state.copy(streamingMessages = state.streamingMessages - requestId)
+                        ChatStateReducer.reduceStreamClear(state, sessionKey, requestId)
                     }
                 }
             }
         }
+    }
+
+    private fun logParsedMessage(
+        eventName: String,
+        payload: JsonObject,
+        message: com.zhubby.klawchat.data.gateway.ChatMessage?,
+    ) {
+        Log.d(
+            "KlawChatGateway",
+            "$eventName parsed=${message != null} role=${message?.role} contentLength=${message?.content?.length ?: 0} keys=${payload.keys}",
+        )
     }
 
     private suspend fun runBusy(block: suspend () -> Unit) {
