@@ -1,8 +1,11 @@
 package com.zhubby.klawchat.data.gateway
 
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -14,33 +17,85 @@ class GatewayFrameTest {
     }
 
     @Test
-    fun encodesMethodFrameWithParams() {
-        val frame = GatewayClientFrame.Method(
+    fun encodesClientRequestFrameWithParams() {
+        val frame = GatewayClientRequest(
             id = "42",
-            method = "session.submit",
-            params = mapOf("input" to JsonPrimitive("hello")),
+            method = "turn/start",
+            params = buildJsonObject { put("input", "hello") },
         )
 
-        val encoded = json.encodeToString(GatewayClientFrame.serializer(), frame)
+        val encoded = GatewayJson.encodeToString(GatewayClientRequest.serializer(), frame)
         val tree = json.parseToJsonElement(encoded).jsonObject
 
-        assertEquals("method", tree["type"]?.toString()?.trim('"'))
         assertEquals("42", tree["id"]?.toString()?.trim('"'))
-        assertEquals("session.submit", tree["method"]?.toString()?.trim('"'))
+        assertEquals("turn/start", tree["method"]?.toString()?.trim('"'))
         assertEquals("hello", tree["params"]?.jsonObject?.get("input")?.toString()?.trim('"'))
     }
 
     @Test
-    fun decodesEventFrame() {
-        val decoded = json.decodeFromString(
-            GatewayServerFrame.serializer(),
-            """{"type":"event","event":"session.stream.delta","payload":{"content":"Hi"}}""",
+    fun encodesClientNotificationFrameWithoutId() {
+        val frame = GatewayClientNotification(
+            method = "initialized",
+            params = JsonObject(emptyMap()),
         )
 
-        assertTrue(decoded is GatewayServerFrame.Event)
-        val event = decoded as GatewayServerFrame.Event
-        assertEquals("session.stream.delta", event.event)
-        assertEquals("Hi", event.payload["content"]?.toString()?.trim('"'))
+        val encoded = GatewayJson.encodeToString(GatewayClientNotification.serializer(), frame)
+        val tree = json.parseToJsonElement(encoded).jsonObject
+
+        assertTrue(tree.containsKey("method"))
+        assertTrue(!tree.containsKey("id"))
+        assertEquals("initialized", tree["method"]?.toString()?.trim('"'))
+    }
+
+    @Test
+    fun decodesResultFrame() {
+        val decoded = GatewayJson.decodeFromString(
+            GatewayServerFrameDeserializer,
+            """{"id":"42","result":{"status":"ok"}}""",
+        )
+
+        assertTrue(decoded is GatewayServerFrame.Result)
+        val result = decoded as GatewayServerFrame.Result
+        assertEquals("42", result.id)
+    }
+
+    @Test
+    fun decodesErrorFrame() {
+        val decoded = GatewayJson.decodeFromString(
+            GatewayServerFrameDeserializer,
+            """{"id":"42","error":{"code":"invalid_params","message":"bad input"}}""",
+        )
+
+        assertTrue(decoded is GatewayServerFrame.Error)
+        val error = decoded as GatewayServerFrame.Error
+        assertEquals("42", error.id)
+        assertEquals("invalid_params", error.error.code)
+    }
+
+    @Test
+    fun decodesNotificationFrame() {
+        val decoded = GatewayJson.decodeFromString(
+            GatewayServerFrameDeserializer,
+            """{"method":"item/agentMessage/delta","params":{"session_id":"ws:abc","content":"Hi"}}""",
+        )
+
+        assertTrue(decoded is GatewayServerFrame.Notification)
+        val notification = decoded as GatewayServerFrame.Notification
+        assertEquals("item/agentMessage/delta", notification.method)
+        assertEquals("Hi", notification.params["content"]?.toString()?.trim('"'))
+    }
+
+    @Test
+    fun decodesReverseRequestFrame() {
+        val decoded = GatewayJson.decodeFromString(
+            GatewayServerFrameDeserializer,
+            """{"id":"srv_1","method":"approval/request","params":{"session_id":"ws:abc"}}""",
+        )
+
+        assertTrue(decoded is GatewayServerFrame.ReverseRequest)
+        val request = decoded as GatewayServerFrame.ReverseRequest
+        assertEquals("srv_1", request.id)
+        assertEquals("approval/request", request.method)
     }
 
     @Test
@@ -122,7 +177,7 @@ class GatewayFrameTest {
     }
 
     @Test
-    fun parsesHistoryMessagesResultFromGateway() {
+    fun parsesHistoryMessagesResultFromGatewayPage() {
         val result = json.parseToJsonElement(
             """
             {
@@ -292,5 +347,36 @@ class GatewayFrameTest {
         assert(first != null)
         assert(second != null)
         assert(first?.id != second?.id)
+    }
+
+    @Test
+    fun parsesV1ItemCompletedNotificationAsMessage() {
+        val payload = json.parseToJsonElement(
+            """
+            {
+              "session_id": "session-1",
+              "thread_id": "session-1",
+              "turn_id": "turn-1",
+              "item": {
+                "item_id": "item-agent-1",
+                "type": "agentMessage",
+                "status": "completed",
+                "payload": {
+                  "message": {
+                    "content": "agent response",
+                    "metadata": {},
+                    "attachments": []
+                  }
+                }
+              }
+            }
+            """.trimIndent(),
+        ).jsonObject
+
+        val message = payload.chatMessage(fallbackSessionKey = "session-1")
+
+        assertEquals("agent response", message?.content)
+        assertEquals("session-1", message?.sessionKey)
+        assertEquals("assistant", message?.role)
     }
 }

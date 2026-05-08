@@ -29,4 +29,27 @@ class GatewayEndpointTest {
             endpoint.webSocketUrl,
         )
     }
+
+    @Test
+    fun httpBaseUrlReturnsTrimmedBaseUrl() {
+        val endpoint = GatewayEndpoint(
+            baseUrl = "http://localhost:3000/",
+            token = "",
+        )
+
+        assertEquals("http://localhost:3000", endpoint.httpBaseUrl)
+    }
+
+    @Test
+    fun bareHostBuildsWsUrl() {
+        val endpoint = GatewayEndpoint(
+            baseUrl = "192.168.1.1:8080",
+            token = "secret",
+        )
+
+        assertEquals(
+            "ws://192.168.1.1:8080/ws/chat?token=secret",
+            endpoint.webSocketUrl,
+        )
+    }
 }
