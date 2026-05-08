@@ -25,7 +25,6 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.serialization.json.JsonObject
 
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val settingsStore = GatewaySettingsStore(application.applicationContext)
@@ -52,7 +51,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             repository.connectionStates.collect { state ->
                 _uiState.update {
                     when (state) {
-                        GatewayConnectionState.Connected -> it.copy(
+                        GatewayConnectionState.Initialized -> it.copy(
                             connectionStatus = ConnectionStatus.Connected,
                             statusMessage = "Connected",
                         )
@@ -76,7 +75,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             repository.events.collect { event ->
                 runCatching { handleEvent(event) }
                     .onFailure { error ->
-                        Log.w("KlawChatGateway", "Failed to handle ${event.event}", error)
+                        Log.w("KlawChatGateway", "Failed to handle ${event.method}", error)
                         _uiState.update { it.copy(statusMessage = error.message ?: "Failed to handle gateway event") }
                     }
             }
@@ -87,7 +86,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             runCatching {
                 repository.connect(GatewayEndpoint(currentSettings.baseUrl, currentSettings.token))
-                repository.ping()
+                // v1: initialize is done inside connectAndWait, no separate ping needed
                 val bootstrap = repository.bootstrap()
                 val catalog = repository.listProviders()
                 val selected = currentSettings.lastSessionKey
@@ -193,16 +192,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     resolver.openInputStream(uri)?.use { it.readBytes() }
                         ?: error("Unable to read selected file")
                 }
-                val attachment = withContext(Dispatchers.IO) {
-                    archiveApi.upload(
-                        baseUrl = currentSettings.baseUrl,
-                        token = currentSettings.token,
-                        bytes = bytes,
-                        filename = filename,
-                        mimeType = mimeType,
-                        sessionKey = sessionKey,
-                    )
-                }
+                val attachment = archiveApi.upload(
+                    baseUrl = currentSettings.baseUrl,
+                    token = currentSettings.token,
+                    bytes = bytes,
+                    filename = filename,
+                    mimeType = mimeType,
+                    sessionKey = sessionKey,
+                )
                 _uiState.update { it.copy(pendingAttachments = it.pendingAttachments + attachment) }
             }
         }
@@ -277,55 +274,115 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun handleEvent(event: GatewayServerFrame.Event) {
-        val payload = JsonObject(event.payload)
-        when (event.event) {
+    /** v1: handle notification events using method field instead of event field */
+    private fun handleEvent(event: GatewayServerFrame.Notification) {
+        val params = event.params
+        when (event.method) {
+            // v1: agent message streaming
+            "item/agentMessage/delta" -> {
+                val sessionKey = params.string("session_id") ?: uiState.value.selectedSessionKey
+                val turnId = params.string("turn_id") ?: sessionKey
+                val content = params.streamDeltaText()
+                if (sessionKey != null && turnId != null) {
+                    _uiState.update { ChatStateReducer.reduceStreamDelta(it, sessionKey, turnId, content) }
+                }
+            }
+
+            // v1: clear streaming buffer
+            "item/agentMessage/clear" -> {
+                val sessionKey = params.string("session_id") ?: uiState.value.selectedSessionKey
+                val turnId = params.string("turn_id")
+                _uiState.update { state ->
+                    ChatStateReducer.reduceStreamClear(state, sessionKey, turnId)
+                }
+            }
+
+            // v1: item completed (includes assistant message finalization)
+            "item/completed" -> {
+                val item = params["item"]?.let { it as? kotlinx.serialization.json.JsonObject }
+                val message = (params + (item ?: emptyMap())).chatMessage(
+                    fallbackSessionKey = params.string("session_id"),
+                )
+                logParsedMessage(event.method, params, message)
+                if (message != null) {
+                    _uiState.update { ChatStateReducer.reduceMessage(it, message) }
+                }
+            }
+
+            // v1: turn completed — finalize streaming if no message was delivered
+            "turn/completed",
+            "turn/failed",
+            "turn/interrupted" -> {
+                val sessionKey = params.string("session_id") ?: uiState.value.selectedSessionKey
+                val turnId = params.string("turn_id")
+                // Clear any remaining streaming content
+                _uiState.update { state ->
+                    ChatStateReducer.reduceStreamClear(state, sessionKey, turnId)
+                }
+            }
+
+            // v1: session subscribed / unsubscribed notifications
+            "session/subscribed",
+            "session/unsubscribed" -> {
+                Log.d("KlawChatGateway", "${event.method}: ${params.string("session_key")}")
+            }
+
+            // v1: legacy session.message compatibility (if server still sends old format)
             "session.message" -> {
-                val message = payload.chatMessage()
-                logParsedMessage(event.event, payload, message)
+                val message = params.chatMessage()
+                logParsedMessage(event.method, params, message)
                 message?.let {
                     _uiState.update { state -> ChatStateReducer.reduceMessage(state, it) }
                 }
             }
+
+            // v1: legacy stream notifications compatibility
             "session.stream.delta" -> {
-                val sessionKey = payload.string("session_key") ?: uiState.value.selectedSessionKey
-                val requestId = payload.string("request_id") ?: sessionKey
-                val content = payload.streamDeltaText()
+                val sessionKey = params.string("session_key") ?: uiState.value.selectedSessionKey
+                val requestId = params.string("request_id") ?: sessionKey
+                val content = params.streamDeltaText()
                 if (sessionKey != null && requestId != null) {
                     _uiState.update { ChatStateReducer.reduceStreamDelta(it, sessionKey, requestId, content) }
                 }
             }
+
             "session.stream.clear" -> {
-                val sessionKey = payload.string("session_key") ?: uiState.value.selectedSessionKey
-                val requestId = payload.string("request_id")
+                val sessionKey = params.string("session_key") ?: uiState.value.selectedSessionKey
+                val requestId = params.string("request_id")
                 _uiState.update { state ->
                     ChatStateReducer.reduceStreamClear(state, sessionKey, requestId)
                 }
             }
+
             "session.stream.done" -> {
-                val message = payload.chatMessage()
-                logParsedMessage(event.event, payload, message)
+                val message = params.chatMessage()
+                logParsedMessage(event.method, params, message)
                 if (message != null) {
                     _uiState.update { ChatStateReducer.reduceMessage(it, message) }
                 } else {
-                    val sessionKey = payload.string("session_key") ?: uiState.value.selectedSessionKey
-                    val requestId = payload.string("request_id")
+                    val sessionKey = params.string("session_key") ?: uiState.value.selectedSessionKey
+                    val requestId = params.string("request_id")
                     _uiState.update { state ->
                         ChatStateReducer.reduceStreamClear(state, sessionKey, requestId)
                     }
                 }
+            }
+
+            // Catch-all for other notification methods (item/started, item/updated, reasoning/delta, plan/delta, etc.)
+            else -> {
+                Log.d("KlawChatGateway", "Unhandled notification: ${event.method}")
             }
         }
     }
 
     private fun logParsedMessage(
         eventName: String,
-        payload: JsonObject,
+        params: kotlinx.serialization.json.JsonObject,
         message: com.zhubby.klawchat.data.gateway.ChatMessage?,
     ) {
         Log.d(
             "KlawChatGateway",
-            "$eventName parsed=${message != null} role=${message?.role} contentLength=${message?.content?.length ?: 0} keys=${payload.keys}",
+            "$eventName parsed=${message != null} role=${message?.role} contentLength=${message?.content?.length ?: 0} keys=${params.keys}",
         )
     }
 
