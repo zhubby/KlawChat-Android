@@ -1,7 +1,13 @@
 package com.zhubby.klawchat.data.gateway
 
-import kotlinx.coroutines.CoroutineScope
+import io.ktor.client.HttpClient
+import io.ktor.client.plugins.websocket.Websockets
+import io.ktor.client.plugins.websocket.ws
+import io.ktor.client.plugins.websocket.wss
+import io.ktor.websocket.Frame
+import io.ktor.websocket.readText
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -9,14 +15,13 @@ import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.JsonElement
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.Response
-import okhttp3.WebSocket
-import okhttp3.WebSocketListener
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import java.io.Closeable
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -24,23 +29,50 @@ import java.util.concurrent.ConcurrentHashMap
 sealed interface GatewayConnectionState {
     data object Disconnected : GatewayConnectionState
     data object Connecting : GatewayConnectionState
-    data object Connected : GatewayConnectionState
+    data object Initialized : GatewayConnectionState
     data class Failed(val message: String) : GatewayConnectionState
 }
 
+/**
+ * Gateway WebSocket client using Ktor's [ws]/[wss] functions.
+ *
+ * Ktor's WebSocket API is block-based: [ws] enters a suspend block where
+ * `this` is a `DefaultClientWebSocketSession`. We cannot store the session
+ * outside the block. Instead, we launch the entire ws block in a coroutine
+ * and relay frames to internal [SharedFlow]s.
+ *
+ * Sending is done through a channel-based approach: the ws block reads
+ * outgoing frames from [_outgoing] and sends them, while incoming frames
+ * are deserialized and emitted to [_events]/[_reverseRequests].
+ */
 class GatewayWsClient(
-    private val okHttpClient: OkHttpClient = OkHttpClient(),
+    private val httpClient: HttpClient = HttpClient {
+        install(Websockets) {
+            pingIntervalMillis = 20_000
+        }
+    },
 ) : Closeable {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val pendingResults = ConcurrentHashMap<String, CompletableDeferred<JsonElement>>()
-    private var webSocket: WebSocket? = null
-    private var openDeferred: CompletableDeferred<Unit>? = null
+    private var connectionJob: kotlinx.coroutines.Job? = null
+    private var wsConnected = CompletableDeferred<Unit>()
 
-    private val _events = MutableSharedFlow<GatewayServerFrame.Event>(
+    private val _outgoing = MutableSharedFlow<String>(
         extraBufferCapacity = 64,
         onBufferOverflow = BufferOverflow.DROP_OLDEST,
     )
-    val events: SharedFlow<GatewayServerFrame.Event> = _events.asSharedFlow()
+
+    private val _events = MutableSharedFlow<GatewayServerFrame.Notification>(
+        extraBufferCapacity = 64,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
+    val events: SharedFlow<GatewayServerFrame.Notification> = _events.asSharedFlow()
+
+    private val _reverseRequests = MutableSharedFlow<GatewayServerFrame.ReverseRequest>(
+        extraBufferCapacity = 16,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
+    val reverseRequests: SharedFlow<GatewayServerFrame.ReverseRequest> = _reverseRequests.asSharedFlow()
 
     private val _connectionStates = MutableSharedFlow<GatewayConnectionState>(
         replay = 1,
@@ -49,37 +81,142 @@ class GatewayWsClient(
     )
     val connectionStates: SharedFlow<GatewayConnectionState> = _connectionStates.asSharedFlow()
 
-    fun connect(endpoint: GatewayEndpoint) {
+    /**
+     * Connect to the gateway WebSocket endpoint and perform the v1 initialize handshake.
+     */
+    suspend fun connect(endpoint: GatewayEndpoint) {
         closeSocket()
-        openDeferred = CompletableDeferred()
+        wsConnected = CompletableDeferred()
         _connectionStates.tryEmit(GatewayConnectionState.Connecting)
-        val request = Request.Builder()
-            .url(endpoint.webSocketUrl)
-            .apply {
-                if (endpoint.token.isNotBlank()) {
-                    header("Authorization", "Bearer ${endpoint.token}")
+
+        connectionJob = scope.launch {
+            runCatching {
+                // Determine ws vs wss based on URL scheme
+                val wsUrl = endpoint.webSocketUrl
+                if (wsUrl.startsWith("wss://")) {
+                    httpClient.wss(urlString = wsUrl) {
+                        handleSession(endpoint)
+                    }
+                } else {
+                    httpClient.ws(urlString = wsUrl) {
+                        handleSession(endpoint)
+                    }
+                }
+            }.onFailure { error ->
+                if (scope.isActive) {
+                    _connectionStates.tryEmit(
+                        GatewayConnectionState.Failed(error.message ?: "WebSocket connection failed"),
+                    )
+                    wsConnected.completeExceptionally(error)
+                    pendingResults.values.forEach { it.completeExceptionally(error) }
+                    pendingResults.clear()
                 }
             }
-            .build()
-        webSocket = okHttpClient.newWebSocket(request, listener)
+        }
+
+        // Wait for WebSocket to be open before returning
+        withTimeout(15_000) { wsConnected.await() }
     }
 
     suspend fun connectAndWait(endpoint: GatewayEndpoint, timeoutMs: Long = 15_000) {
-        connect(endpoint)
         withTimeout(timeoutMs) {
-            checkNotNull(openDeferred).await()
+            connect(endpoint)
         }
+    }
+
+    /**
+     * Inside the ws() block, this function:
+     * 1. Signals that the connection is open
+     * 2. Starts outgoing frame writer (reads from _outgoing and sends text frames)
+     * 3. Reads incoming frames and processes them
+     * 4. Performs v1 initialize handshake
+     */
+    private suspend fun io.ktor.client.plugins.websocket.DefaultClientWebSocketSession.handleSession(
+        endpoint: GatewayEndpoint,
+    ) {
+        // Signal connected
+        wsConnected.complete(Unit)
+
+        // Start outgoing frame writer
+        val writerJob = launch {
+            _outgoing.collect { text ->
+                send(Frame.Text(text))
+            }
+        }
+
+        // Perform v1 initialize handshake
+        runCatching { initialize() }.onFailure { error ->
+            _connectionStates.tryEmit(GatewayConnectionState.Failed(error.message ?: "Initialize failed"))
+            writerJob.cancel()
+            return
+        }
+
+        _connectionStates.tryEmit(GatewayConnectionState.Initialized)
+
+        // Read incoming frames
+        try {
+            for (frame in incoming) {
+                if (!isActive) break
+                when (frame) {
+                    is Frame.Text -> handleTextFrame(frame.readText())
+                    is Frame.Binary -> {
+                        // v1 spec: binary frames are invalid, ignore
+                    }
+
+                    else -> { /* Ping/Pong handled by Ktor */
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            if (scope.isActive) {
+                _connectionStates.tryEmit(GatewayConnectionState.Failed(e.message ?: "WebSocket read failed"))
+                pendingResults.values.forEach { it.completeExceptionally(e) }
+                pendingResults.clear()
+            }
+        } finally {
+            writerJob.cancel()
+            if (scope.isActive) {
+                _connectionStates.tryEmit(GatewayConnectionState.Disconnected)
+            }
+        }
+    }
+
+    /** v1 initialize handshake: send initialize request, then initialized notification */
+    private suspend fun initialize() {
+        sendAndWaitResult(
+            method = "initialize",
+            params = buildJsonObject {
+                put("client_info", buildJsonObject {
+                    put("name", "klawchat-android")
+                    put("title", "KlawChat Android")
+                    put("version", "1.0")
+                })
+                put("capabilities", buildJsonObject {
+                    put("protocol_version", "v1")
+                    put("experimental", false)
+                    put("turns", true)
+                    put("items", true)
+                    put("tools", true)
+                    put("approvals", true)
+                    put("server_requests", true)
+                    put("cancellation", true)
+                    put("steering", true)
+                    put("schema", true)
+                })
+            },
+        )
+        sendNotification("initialized")
     }
 
     suspend fun sendAndWaitResult(
         method: String,
-        params: Map<String, JsonElement> = emptyMap(),
+        params: JsonObject = JsonObject(emptyMap()),
         timeoutMs: Long = 15_000,
     ): JsonElement {
         val id = UUID.randomUUID().toString()
         val deferred = CompletableDeferred<JsonElement>()
         pendingResults[id] = deferred
-        sendFrame(GatewayClientFrame.Method(id = id, method = method, params = params))
+        sendRequest(id = id, method = method, params = params)
         return try {
             withTimeout(timeoutMs) { deferred.await() }
         } finally {
@@ -89,65 +226,58 @@ class GatewayWsClient(
 
     fun send(
         method: String,
-        params: Map<String, JsonElement> = emptyMap(),
+        params: JsonObject = JsonObject(emptyMap()),
     ): String {
         val id = UUID.randomUUID().toString()
-        sendFrame(GatewayClientFrame.Method(id = id, method = method, params = params))
+        scope.launch { sendRequest(id = id, method = method, params = params) }
         return id
+    }
+
+    suspend fun sendNotification(
+        method: String,
+        params: JsonObject = JsonObject(emptyMap()),
+    ) {
+        val frame = GatewayClientNotification(method = method, params = params)
+        _outgoing.emit(GatewayJson.encodeToString(GatewayClientNotification.serializer(), frame))
+    }
+
+    private suspend fun sendRequest(id: String, method: String, params: JsonObject) {
+        val frame = GatewayClientRequest(id = id, method = method, params = params)
+        _outgoing.emit(GatewayJson.encodeToString(GatewayClientRequest.serializer(), frame))
     }
 
     override fun close() {
         closeSocket()
         scope.cancel()
-        okHttpClient.dispatcher.executorService.shutdown()
+        httpClient.close()
     }
 
-    private fun sendFrame(frame: GatewayClientFrame.Method) {
-        val socket = checkNotNull(webSocket) { "Gateway WebSocket is not connected." }
-        socket.send(GatewayJson.encodeToString(GatewayClientFrame.serializer(), frame))
+    private fun handleTextFrame(text: String) {
+        runCatching {
+            GatewayJson.decodeFromString(GatewayServerFrameDeserializer, text)
+        }.onSuccess { frame ->
+            when (frame) {
+                is GatewayServerFrame.Result -> pendingResults.remove(frame.id)?.complete(frame.result)
+                is GatewayServerFrame.Error -> frame.id?.let { id ->
+                    pendingResults.remove(id)?.completeExceptionally(
+                        IllegalStateException("${frame.error.code}: ${frame.error.message}"),
+                    )
+                }
+
+                is GatewayServerFrame.Notification -> scope.launch { _events.emit(frame) }
+                is GatewayServerFrame.ReverseRequest -> scope.launch { _reverseRequests.emit(frame) }
+            }
+        }.onFailure {
+            // Log but don't crash on unrecognized frames
+        }
     }
 
     private fun closeSocket() {
-        webSocket?.close(1000, "Closing")
-        webSocket = null
+        connectionJob?.cancel()
+        connectionJob = null
+        wsConnected.cancel()
         pendingResults.values.forEach { it.cancel() }
         pendingResults.clear()
-        openDeferred?.cancel()
-        openDeferred = null
         _connectionStates.tryEmit(GatewayConnectionState.Disconnected)
-    }
-
-    private val listener = object : WebSocketListener() {
-        override fun onOpen(webSocket: WebSocket, response: Response) {
-            _connectionStates.tryEmit(GatewayConnectionState.Connected)
-            openDeferred?.complete(Unit)
-        }
-
-        override fun onMessage(webSocket: WebSocket, text: String) {
-            runCatching {
-                GatewayJson.decodeFromString(GatewayServerFrame.serializer(), text)
-            }.onSuccess { frame ->
-                when (frame) {
-                    is GatewayServerFrame.Result -> pendingResults.remove(frame.id)?.complete(frame.result)
-                    is GatewayServerFrame.Error -> frame.id?.let { id ->
-                        pendingResults.remove(id)?.completeExceptionally(
-                            IllegalStateException("${frame.error.code}: ${frame.error.message}"),
-                        )
-                    }
-                    is GatewayServerFrame.Event -> scope.launch { _events.emit(frame) }
-                }
-            }
-        }
-
-        override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-            _connectionStates.tryEmit(GatewayConnectionState.Failed(t.message ?: "WebSocket failed"))
-            openDeferred?.completeExceptionally(t)
-            pendingResults.values.forEach { it.completeExceptionally(t) }
-            pendingResults.clear()
-        }
-
-        override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-            _connectionStates.tryEmit(GatewayConnectionState.Disconnected)
-        }
     }
 }

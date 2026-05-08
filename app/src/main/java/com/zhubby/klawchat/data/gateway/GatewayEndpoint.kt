@@ -1,24 +1,28 @@
 package com.zhubby.klawchat.data.gateway
 
-import okhttp3.HttpUrl.Companion.toHttpUrl
-
 data class GatewayEndpoint(
     val baseUrl: String,
     val token: String,
 ) {
     val webSocketUrl: String
         get() {
-            val httpUrl = baseUrl.toHttpUrl()
-            val builder = httpUrl.newBuilder()
-                .encodedPath("/ws/chat")
-                .query(null)
-            if (token.isNotBlank()) {
-                builder.addQueryParameter("token", token)
+            val url = baseUrl.trimEnd('/')
+            val wsBase = when {
+                url.startsWith("https://") -> url.replaceFirst("https://", "wss://")
+                url.startsWith("http://") -> url.replaceFirst("http://", "ws://")
+                else -> "ws://$url"
             }
-            val chatUrl = builder.build().toString()
-            return when (httpUrl.scheme) {
-                "https" -> chatUrl.replaceFirst("https://", "wss://")
-                else -> chatUrl.replaceFirst("http://", "ws://")
-            }
+            val query = if (token.isNotBlank()) "?token=${encodeQueryParam(token)}" else ""
+            return "$wsBase/ws/chat$query"
         }
+
+    val httpBaseUrl: String
+        get() = baseUrl.trimEnd('/')
+
+    private fun encodeQueryParam(value: String): String =
+        value.replace("%", "%25")
+            .replace(" ", "%20")
+            .replace("&", "%26")
+            .replace("=", "%3D")
+            .replace("+", "%2B")
 }

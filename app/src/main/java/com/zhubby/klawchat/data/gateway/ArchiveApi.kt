@@ -1,16 +1,23 @@
 package com.zhubby.klawchat.data.gateway
 
+import io.ktor.client.HttpClient
+import io.ktor.client.engine.okhttp.OkHttp
+import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.client.request.forms.formData
+import io.ktor.client.request.forms.submitFormWithBinaryData
+import io.ktor.client.request.header
+import io.ktor.client.request.url
+import io.ktor.client.statement.bodyAsText
+import io.ktor.http.HttpHeaders
+import io.ktor.serialization.kotlinx.json.json
 import kotlinx.serialization.json.jsonObject
-import okhttp3.MediaType.Companion.toMediaTypeOrNull
-import okhttp3.MultipartBody
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 
 class ArchiveApi(
-    private val okHttpClient: OkHttpClient = OkHttpClient(),
+    private val httpClient: HttpClient = HttpClient(OkHttp) {
+        install(ContentNegotiation) { json(GatewayJson) }
+    },
 ) {
-    fun upload(
+    suspend fun upload(
         baseUrl: String,
         token: String,
         bytes: ByteArray,
@@ -18,35 +25,33 @@ class ArchiveApi(
         mimeType: String?,
         sessionKey: String?,
     ): ArchiveAttachment {
-        val mediaType = mimeType?.toMediaTypeOrNull()
-        val multipart = MultipartBody.Builder()
-            .setType(MultipartBody.FORM)
-            .addFormDataPart("file", filename, bytes.toRequestBody(mediaType))
-            .apply {
-                sessionKey?.let { addFormDataPart("session_key", it) }
-            }
-            .build()
-        val requestBuilder = Request.Builder()
-            .url(baseUrl.trimEnd('/') + "/archive/upload")
-            .post(multipart)
-        if (token.isNotBlank()) {
-            requestBuilder.header("Authorization", "Bearer $token")
+        val response = httpClient.submitFormWithBinaryData(
+            formData {
+                append("file", bytes, headers = {
+                    if (mimeType != null) append(HttpHeaders.ContentDisposition, "filename=\"$filename\"")
+                    if (mimeType != null) append(HttpHeaders.ContentType, mimeType)
+                })
+                if (sessionKey != null) append("session_key", sessionKey)
+            },
+        ) {
+            url("${baseUrl.trimEnd('/')}/archive/upload")
+            if (token.isNotBlank()) header("Authorization", "Bearer $token")
         }
-        okHttpClient.newCall(requestBuilder.build()).execute().use { response ->
-            if (!response.isSuccessful) {
-                error("Archive upload failed: HTTP ${response.code}")
-            }
-            val body = response.body.string()
-            val root = GatewayJson.parseToJsonElement(body).jsonObject
-            val record = root["record"]?.jsonObject ?: root
-            val archiveId = record.string("archive_id") ?: record.string("id")
-                ?: error("Archive upload response is missing archive_id")
-            return ArchiveAttachment(
-                archiveId = archiveId,
-                filename = record.string("filename") ?: filename,
-                mimeType = record.string("mime_type") ?: mimeType,
-                size = record.string("size")?.toLongOrNull(),
-            )
+
+        if (response.status.value >= 400) {
+            error("Archive upload failed: HTTP ${response.status.value}")
         }
+
+        val body = response.bodyAsText()
+        val root = GatewayJson.parseToJsonElement(body).jsonObject
+        val record = root["record"]?.jsonObject ?: root
+        val archiveId = record.string("archive_id") ?: record.string("id")
+            ?: error("Archive upload response is missing archive_id")
+        return ArchiveAttachment(
+            archiveId = archiveId,
+            filename = record.string("filename") ?: filename,
+            mimeType = record.string("mime_type") ?: mimeType,
+            size = record.string("size")?.toLongOrNull(),
+        )
     }
 }
