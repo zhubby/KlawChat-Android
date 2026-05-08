@@ -1,143 +1,385 @@
 # Agents
 
-KlawChat 中的 **Agent** 代表一个独立的 AI 对话会话。每个 Agent 拥有自己的对话历史、配置和状态，可与不同的 AI Provider 和模型进行交互。
+An **Agent** in KlawChat represents an independent AI conversation session. Each Agent owns its own conversation history, configuration, and state, and can interact with different AI providers and models via the Gateway WebSocket protocol.
 
-## 核心概念
+## Core Concepts
 
-### Agent 与 Session
+### Agent vs Session
 
-- **Agent**: UI 层面的抽象，用户可见的对话实体
-- **Session**: 后端标识符，通过 `sessionKey` 唯一标识一个对话上下文
-- 每个 Agent 对应一个 `WorkspaceSession`，包含标题、模型配置等元数据
+- **Agent** — UI-level abstraction; the visible conversation entity rendered by Compose screens
+- **Session** — Backend identifier; a `sessionKey` uniquely identifies a conversation context
+- Every Agent maps to a `WorkspaceSession` that carries metadata like title, model provider, and model name
 
-## 数据模型
+### Architecture Overview
+
+The Agent subsystem follows an MVI (Model-View-Intent) pattern:
+
+```
+UI (Compose) → ViewModel (intents) → Repository (gateway calls) → WebSocket (v1 JSON-RPC)
+     ↑                                                           ↓
+  StateFlow ← StateReducer ← Server Frames (notifications/events)
+```
+
+| Layer             | Key class             | Responsibility                                      |
+|-------------------|-----------------------|-----------------------------------------------------|
+| UI                | `AgentListScreen`     | Renders session list, connection status, actions    |
+| UI                | `AgentSettingsSheet`  | Modal bottom sheet for title/provider/model editing |
+| ViewModel         | `ChatViewModel`       | Orchestrates intents, holds `ChatUiState`           |
+| State             | `ChatStateReducer`    | Pure reduce functions for state transitions          |
+| Repository        | `ChatRepository`      | Gateway RPC calls (`createSession`, `submit`, etc.) |
+| Network           | `GatewayWsClient`     | Ktor WebSocket client, v1 JSON-RPC frame routing    |
+| Persistence       | `GatewaySettingsStore`| DataStore-backed settings (baseUrl, token, etc.)    |
+
+## Data Models
+
+### WorkspaceSession
 
 ```kotlin
 @Serializable
 data class WorkspaceSession(
-    val sessionKey: String,      // 唯一标识符
-    val title: String?,          // 用户自定义标题
-    val createdAtMs: Long?,      // 创建时间戳
-    val modelProvider: String?,  // AI 提供商 (如 anthropic, openai)
-    val model: String?,          // 具体模型 (如 claude-opus-4-7)
+    @SerialName("session_key") val sessionKey: String,
+    val title: String? = null,
+    @SerialName("created_at_ms") val createdAtMs: Long? = null,
+    @SerialName("model_provider") val modelProvider: String? = null,
+    val model: String? = null,
 )
 ```
 
-## 创建 Agent
+Serialized via `kotlinx.serialization` with `@SerialName` annotations matching the gateway's snake_case wire format. All nullable fields use `= null` defaults to tolerate partial server responses.
 
-### 从 UI 创建
-
-1. 在 Agent 列表页点击 "New Agent" 按钮
-2. 系统通过 Gateway 创建新 Session
-3. 自动生成 `sessionKey` 并返回
-
-### 程序化创建
-
-```kotlin
-// 发送 create_session 帧到 Gateway
-val frame = GatewayFrame.CreateSession(
-    sessionKey = UUID.randomUUID().toString(),
-    title = "新 Agent",
-    modelProvider = "anthropic",
-    model = "claude-sonnet-4-6"
-)
-```
-
-## 配置 Agent
-
-### 可配置项
-
-| 属性 | 说明 | 示例 |
-|------|------|------|
-| title | Agent 显示名称 | "代码助手" |
-| modelProvider | AI 提供商 ID | "anthropic", "openai" |
-| model | 具体模型名称 | "claude-opus-4-7" |
-
-### Provider 配置
-
-可用的 Provider 通过 Gateway 动态获取：
+### Provider & ProviderCatalog
 
 ```kotlin
 @Serializable
 data class Provider(
-    val id: String,              // provider 标识
-    val name: String?,           // 显示名称
-    val defaultModel: String?,   // 默认模型
-    val stream: Boolean,         // 是否支持流式响应
-    val hasApiKey: Boolean,      // 是否已配置 API Key
+    val id: String,
+    val name: String? = null,
+    @SerialName("default_model") val defaultModel: String? = null,
+    val stream: Boolean = true,
+    @SerialName("has_api_key") val hasApiKey: Boolean = false,
+)
+
+@Serializable
+data class ProviderCatalog(
+    val providers: List<Provider> = emptyList(),
+    @SerialName("default_provider") val defaultProvider: String? = null,
 )
 ```
 
-## 与 Agent 交互
+Providers are fetched dynamically via `ChatRepository.listProviders()` and rendered in `AgentSettingsSheet` as suggestions.
 
-### 发送消息
+### ChatMessage (internal UI model)
 
 ```kotlin
-val message = GatewayFrame.SendMessage(
-    sessionKey = agent.sessionKey,
-    content = "你好，请帮我...",
-    attachments = emptyList()
+data class ChatMessage(
+    val id: String,
+    val sessionKey: String,
+    val role: String,          // "user" | "assistant"
+    val content: String,
+    val timestampMs: Long? = null,
+    val requestId: String? = null,
+    val attachments: List<ArchiveAttachment> = emptyList(),
 )
-webSocketClient.send(message)
 ```
 
-### 接收响应
+Not directly serialized from the wire — parsed from gateway JSON-RPC result payloads via the `JsonObject.chatMessage()` extension function.
 
-Agent 响应通过 WebSocket 流式返回：
+## Creating an Agent
+
+### Via UI
+
+1. User taps "New Agent" button on `AgentListScreen`
+2. `ChatViewModel.createSession()` fires an intent
+3. `ChatRepository.createSession()` sends `session.create` RPC to Gateway
+4. Server returns a new `WorkspaceSession` with a generated `sessionKey`
+5. State is updated; the new session is auto-selected and subscribed
+
+### Programmatically (from ViewModel)
 
 ```kotlin
-// 文本块
-GatewayFrame.TextDelta(sessionKey, delta, finishReason)
-
-// 工具调用
-GatewayFrame.ToolUse(sessionKey, toolUse)
-
-// 错误
-GatewayFrame.Error(sessionKey, message)
+viewModelScope.launch {
+    val session = repository.createSession()           // RPC: session.create
+    _uiState.update { state ->
+        state.copy(
+            sessions = listOf(session) + state.sessions,
+            selectedSessionKey = session.sessionKey,
+        )
+    }
+    selectSession(session.sessionKey)                  // RPC: session.subscribe + session.history.load
+}
 ```
 
-## 生命周期
+## Configuring an Agent
+
+### Configurable Properties
+
+| Property        | Description              | Example                          |
+|-----------------|--------------------------|----------------------------------|
+| `title`         | Display name             | "Code Review Assistant"          |
+| `modelProvider` | AI provider ID           | "anthropic", "openai"            |
+| `model`         | Specific model name      | "claude-opus-4-7", "gpt-4"       |
+
+Configuration is edited via `AgentSettingsSheet` (a `ModalBottomSheet` Composable) and persisted by calling `ChatRepository.updateSession()`:
+
+```kotlin
+repository.updateSession(
+    sessionKey = session.sessionKey,
+    title = title.trim().ifBlank { session.sessionKey },
+    modelProvider = modelProvider.trim().ifBlank { null },
+    model = model.trim().ifBlank { null },
+)
+```
+
+### Provider Configuration
+
+Available providers are fetched at bootstrap:
+
+```kotlin
+val catalog = repository.listProviders()  // RPC: provider.list
+// catalog.providers → list of Provider objects
+// catalog.defaultProvider → fallback provider ID
+```
+
+## Interacting with an Agent
+
+### Sending a Message
+
+```kotlin
+val response = repository.submit(
+    sessionKey = session.sessionKey,
+    input = "Hello, can you help me with…",
+    stream = currentSettings.streamEnabled,
+    modelProvider = session.modelProvider,
+    model = session.model,
+    attachments = selectedAttachments,
+)
+```
+
+When `stream = true`, `submit()` returns `null` and the response is delivered asynchronously via server notifications (see Streaming below).
+
+When `stream = false`, `submit()` blocks until the full response is received and parsed into a `ChatMessage`.
+
+### Uploading Attachments
+
+File attachments use `ArchiveApi` (OkHttp-based multipart upload) before submission:
+
+```kotlin
+val attachment = archiveApi.upload(
+    baseUrl = currentSettings.baseUrl,
+    token = currentSettings.token,
+    bytes = fileBytes,
+    filename = "document.pdf",
+    mimeType = "application/pdf",
+    sessionKey = sessionKey,
+)
+// attachment → ArchiveAttachment(archiveId, filename, mimeType, size)
+```
+
+### Streaming Responses
+
+Agent responses are delivered as server notifications through `SharedFlow`:
+
+```kotlin
+// In ChatViewModel, events are collected from repository.events:
+viewModelScope.launch {
+    repository.events.collect { event ->
+        handleEvent(event)  // routes to ChatStateReducer
+    }
+}
+```
+
+| Notification event          | Reducer function                | Effect                                  |
+|----------------------------|---------------------------------|-----------------------------------------|
+| `session.stream.delta`     | `reduceStreamDelta()`           | Appends text to `StreamingMessage`      |
+| `session.stream.clear`     | `reduceStreamClear()`           | Clears streaming buffer                 |
+| `session.stream.done`      | `reduceMessage()`               | Finalizes assistant message in history  |
+| `session.message`          | `reduceMessage()`               | Adds a complete message (non-streaming) |
+
+### Gateway Frame Protocol
+
+All communication uses v1 JSON-RPC over WebSocket (Ktor client):
+
+```kotlin
+// Client → Server: request with ID
+GatewayClientRequest(id, method, params)
+
+// Client → Server: notification (no ID)
+GatewayClientNotification(method, params)
+
+// Server → Client: result matching a request ID
+GatewayServerFrame.Result(id, result)
+
+// Server → Client: event/notification (no ID)
+GatewayServerFrame.Notification(method, params)
+```
+
+Frame routing in `GatewayWsClient`:
+- Frames with `result` → matched to pending `CompletableDeferred` by ID
+- Frames with `error` → complete pending deferreds with exception
+- Frames with `method` + no `id` → emitted as `events` SharedFlow
+- Frames with `method` + `id` → emitted as `reverseRequests` SharedFlow
+
+## Lifecycle
 
 ```
-Created → Connected → Active → (Disconnected) → Deleted
+Disconnected → Connecting → Connected → Initialized → Active → (Disconnected) → Deleted
 ```
 
-| 状态 | 说明 |
-|------|------|
-| Created | Session 已在后端创建，等待首次连接 |
-| Connected | WebSocket 连接正常，可收发消息 |
-| Active | 正在进行对话 |
-| Disconnected | 连接中断，可尝试重连 |
-| Deleted | Session 已删除，数据清理完成 |
+| State                    | Description                                               |
+|--------------------------|-----------------------------------------------------------|
+| `Disconnected`           | No WebSocket connection; initial or post-close state      |
+| `Connecting`             | Ktor WebSocket session opening                            |
+| `Connected`              | Socket open; v1 `initialize` handshake in progress        |
+| `Initialized`            | Handshake complete; ready for RPC calls                   |
+| `Active`                 | Session subscribed; user is chatting                      |
+| `Disconnected` (re-entry)| Connection lost; user can tap Reconnect                   |
+| `Deleted`                | Session deleted via `session.delete`; data cleaned up     |
 
-## 最佳实践
+Connection state is exposed as `SharedFlow<GatewayConnectionState>` and mapped to `ConnectionStatus` in `ChatUiState` for Compose rendering.
 
-### Agent 命名
+## State Management
 
-- 使用描述性标题区分不同用途的 Agent
-- 示例："代码审查助手"、"文案创作专家"、"技术顾问"
+### ChatUiState
 
-### 模型选择
+```kotlin
+data class ChatUiState(
+    val connectionStatus: ConnectionStatus = ConnectionStatus.Disconnected,
+    val statusMessage: String? = null,
+    val sessions: List<WorkspaceSession> = emptyList(),
+    val selectedSessionKey: String? = null,
+    val messagesBySession: Map<String, List<ChatMessage>> = emptyMap(),
+    val streamingMessages: Map<String, StreamingMessage> = emptyMap(),
+    val pendingAttachments: List<ArchiveAttachment> = emptyList(),
+    val providers: List<Provider> = emptyList(),
+    val defaultProvider: String? = null,
+    val streamEnabled: Boolean = true,
+    val isBusy: Boolean = false,
+)
+```
 
-| 场景 | 推荐 Provider | 推荐 Model |
-|------|---------------|------------|
-| 复杂推理 | anthropic | claude-opus-4-7 |
-| 日常对话 | anthropic | claude-sonnet-4-6 |
-| 快速响应 | anthropic | claude-haiku-4-5 |
-| 代码生成 | openai | gpt-4 |
+### ChatStateReducer (pure functions)
 
-### 会话管理
+All state mutations flow through `ChatStateReducer` — pure functions with no side effects:
 
-- 长期不用的 Agent 建议及时删除，释放资源
-- 重要对话可导出归档（通过 ArchiveApi）
-- 每个 Agent 的对话历史独立存储，互不影响
+| Function                  | Purpose                                              |
+|---------------------------|------------------------------------------------------|
+| `reduceLocalUserMessage`  | Insert optimistic local user message before RPC      |
+| `reduceStreamDelta`       | Append streaming text; skip if snapshot exists       |
+| `reduceStreamClear`       | Clear streaming buffer for a session/request         |
+| `reduceMessage`           | Upsert a message; deduplicate by ID or requestId    |
+| `reduceHistory`           | Merge loaded history with existing messages          |
 
-## 相关文件
+## Best Practices
 
-| 文件 | 说明 |
-|------|------|
-| `AgentListScreen.kt` | Agent 列表 UI |
-| `AgentSettingsSheet.kt` | Agent 配置界面 |
-| `GatewayModels.kt` | 数据模型定义 |
-| `GatewayWsClient.kt` | WebSocket 通信 |
-| `ChatRepository.kt` | 消息存储与同步 |
+### Agent Naming
+
+- Use descriptive titles to distinguish different-purpose Agents
+- Examples: "Code Review Assistant", "Copywriting Expert", "Technical Advisor"
+
+### Model Selection
+
+| Scenario        | Recommended Provider | Recommended Model        |
+|-----------------|----------------------|--------------------------|
+| Complex reasoning | anthropic          | claude-opus-4-7          |
+| Daily conversation | anthropic         | claude-sonnet-4-6        |
+| Fast response   | anthropic            | claude-haiku-4-5         |
+| Code generation | openai               | gpt-4                    |
+
+### Session Management
+
+- Delete idle Agents to free resources (`ChatViewModel.deleteSession()`)
+- Export important conversations via `ArchiveApi` for archiving
+- Each Agent's history is stored independently — switching sessions preserves per-session state
+
+### Error Handling
+
+- Gateway errors surface as `GatewayConnectionState.Failed(message)` → displayed in the connection header
+- RPC failures in the ViewModel are caught with `runCatching` → `statusMessage` updated in UI state
+- Unrecognized server frames are silently dropped to avoid crashing the reader loop
+
+### Thread Safety
+
+- `GatewayWsClient` uses `ConcurrentHashMap` for pending request tracking
+- UI state flows through `MutableStateFlow` (thread-safe by design)
+- Repository and ViewModel operations run on `viewModelScope` (main thread dispatcher)
+- `ArchiveApi.upload()` is blocking OkHttp — wrap in `withContext(Dispatchers.IO)` when called from coroutines
+
+## Source Files
+
+| File                                      | Description                                       |
+|-------------------------------------------|---------------------------------------------------|
+| `ui/agent/AgentListScreen.kt`             | Agent list UI (Compose)                           |
+| `ui/settings/AgentSettingsSheet.kt`       | Agent configuration bottom sheet                  |
+| `ui/chat/ChatViewModel.kt`               | MVI ViewModel orchestrating all agent intents     |
+| `ui/chat/ChatState.kt`                   | `ChatUiState`, `StreamingMessage`, `ChatStateReducer` |
+| `ui/chat/ChatDetailScreen.kt`            | Conversation detail UI                            |
+| `data/gateway/GatewayModels.kt`          | Serializable data models (`WorkspaceSession`, `Provider`, `ChatMessage`, etc.) |
+| `data/gateway/GatewayFrames.kt`          | JSON-RPC frame definitions & deserializer         |
+| `data/gateway/GatewayWsClient.kt`        | Ktor WebSocket client with v1 protocol handling   |
+| `data/gateway/ChatRepository.kt`         | High-level gateway RPC operations                 |
+| `data/gateway/GatewayEndpoint.kt`        | Endpoint URL builder (HTTP → WebSocket conversion)|
+| `data/gateway/ArchiveApi.kt`             | OkHttp multipart file upload                      |
+| `data/settings/GatewaySettingsStore.kt`  | DataStore preferences for connection settings     |
+## Git Commit Guidelines
+
+Commit messages follow the [Conventional Commits](https://www.conventionalcommits.org/) specification. Each commit should be one logical change.
+
+### Commit Message Format
+
+```
+<type>(<scope>): <subject>
+
+<body>
+
+<footer>
+```
+
+- **Subject line**: Required, imperative mood, lowercase, no trailing period, max 72 chars
+- **Body**: Optional, explains *what* and *why*, not *how*
+- **Footer**: Optional, use for `BREAKING CHANGE:`, `Closes #123`, etc.
+
+### Commit Types
+
+
+| Type       | Description                                 |
+| ---------- | ------------------------------------------- |
+| `feat`     | New feature                                 |
+| `fix`      | Bug fix                                     |
+| `docs`     | Documentation changes                       |
+| `style`    | Code style (formatting, semicolons, etc.)   |
+| `refactor` | Code refactoring without behavior change    |
+| `perf`     | Performance improvements                    |
+| `test`     | Test additions or corrections               |
+| `chore`    | Maintenance tasks, dependencies, tooling    |
+| `ci`       | CI/CD configuration changes                 |
+| `build`    | Build system or external dependency changes |
+| `revert`   | Reverting a previous commit                 |
+
+
+### Examples
+
+```
+feat(cli): add agent mode for one-shot requests
+
+Closes #42
+
+feat(core): implement reliability retry with exponential backoff
+
+Add retry policy with configurable max attempts and base delay.
+Idempotency keys prevent duplicate processing on retry.
+
+BREAKING CHANGE: AgentLoop now requires ReliabilityConfig parameter
+
+fix(gui): resolve timestamp formatting in panel display
+
+docs: add git commit guidelines to agents.md
+```
+
+### Pull Request Guidelines
+
+PRs should include:
+
+- Purpose and impacted crates
+- Test evidence (commands run + results)
+- Config/doc updates when behavior changes
+- Sample CLI output when user-facing behavior is modified
