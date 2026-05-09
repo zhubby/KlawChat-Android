@@ -132,41 +132,59 @@ fun JsonElement.objectList(name: String): List<JsonObject> =
     objectOrNull()?.array(name)?.mapNotNull { it.objectOrNull() }.orEmpty()
 
 fun JsonObject.chatMessage(fallbackSessionKey: String? = null): ChatMessage? {
-    // v1: item payload structure
-    val payload = this["payload"]?.objectOrNull()
-    val messageObj = payload?.get("message")?.objectOrNull() ?: this["message"]?.objectOrNull()
+    // v1: item payload structure — params.item.payload.message
+    val itemObj = this["item"]?.objectOrNull()
+    val itemPayload = itemObj?.get("payload")?.objectOrNull() ?: this["payload"]?.objectOrNull()
+    val messageObj = itemPayload?.get("message")?.objectOrNull() ?: this["message"]?.objectOrNull()
+    // Legacy: response object (flat or nested)
+    val responseObj = this["response"]?.objectOrNull() ?: messageObj?.get("response")?.objectOrNull()
     val sessionKey = string("session_key")
-        ?: payload?.string("session_key")
+        ?: itemObj?.string("session_key")
+        ?: itemPayload?.string("session_key")
         ?: messageObj?.string("session_key")
+        ?: responseObj?.string("session_key")
         ?: fallbackSessionKey
         ?: return null
     val role = string("role")
-        ?: payload?.string("role")
+        ?: itemPayload?.string("role")
         ?: messageObj?.string("role")
+        ?: responseObj?.string("role")
         ?: "assistant"
     val content = string("content")
-        ?: payload?.string("content")
+        ?: itemPayload?.string("content")
         ?: messageObj?.string("content")
+        ?: responseObj?.string("content")
         ?: ""
-    if (content.isBlank() && payload == null && messageObj == null) return null
+    if (content.isBlank() && itemPayload == null && messageObj == null && responseObj == null) return null
     val requestId = string("request_id")
-        ?: payload?.string("request_id")
+        ?: itemPayload?.string("request_id")
         ?: messageObj?.string("request_id")
+        ?: responseObj?.string("request_id")
     val timestampMs = long("timestamp_ms")
-        ?: payload?.long("timestamp_ms")
+        ?: itemObj?.long("timestamp_ms")
+        ?: itemPayload?.long("timestamp_ms")
         ?: messageObj?.long("timestamp_ms")
+        ?: responseObj?.string("timestamp_ms")?.toLongOrNull()
     val messageId = string("message_id")
-        ?: payload?.string("message_id")
+        ?: itemObj?.string("item_id")
+        ?: itemPayload?.string("message_id")
         ?: messageObj?.string("message_id")
+        ?: responseObj?.string("message_id")
         ?: string("item_id")
         ?: "local:${java.util.UUID.randomUUID()}"
     val attachments = (
-        this["attachments"]
-            ?: payload?.get("attachments")
-            ?: messageObj?.get("attachments")
-        )?.let { element ->
-        runCatching { GatewayJson.decodeFromJsonElement<List<ArchiveAttachment>>(element) }.getOrDefault(emptyList())
-    }.orEmpty()
+            this["attachments"]
+                ?: itemPayload?.get("attachments")
+                ?: messageObj?.get("attachments")
+                ?: responseObj?.get("attachments")
+            )?.let { element ->
+            runCatching {
+                GatewayJson.decodeFromJsonElement(
+                    kotlinx.serialization.serializer<List<ArchiveAttachment>>(),
+                    element
+                )
+            }.getOrDefault(emptyList())
+        }.orEmpty()
     return ChatMessage(
         id = messageId,
         sessionKey = sessionKey,
@@ -214,4 +232,4 @@ fun JsonObject.historyResult(): HistoryResult {
 }
 
 fun JsonObject.toWorkspaceSession(): WorkspaceSession? =
-    runCatching { GatewayJson.decodeFromJsonElement<WorkspaceSession>(this) }.getOrNull()
+    runCatching { GatewayJson.decodeFromJsonElement(WorkspaceSession.serializer(), this) }.getOrNull()

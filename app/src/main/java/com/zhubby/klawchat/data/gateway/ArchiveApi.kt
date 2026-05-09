@@ -6,8 +6,8 @@ import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.request.forms.formData
 import io.ktor.client.request.forms.submitFormWithBinaryData
 import io.ktor.client.request.header
-import io.ktor.client.request.url
 import io.ktor.client.statement.bodyAsText
+import io.ktor.http.Headers
 import io.ktor.http.HttpHeaders
 import io.ktor.serialization.kotlinx.json.json
 import kotlinx.serialization.json.jsonObject
@@ -25,16 +25,15 @@ class ArchiveApi(
         mimeType: String?,
         sessionKey: String?,
     ): ArchiveAttachment {
-        val response = httpClient.submitFormWithBinaryData(
-            formData {
-                append("file", bytes, headers = {
-                    if (mimeType != null) append(HttpHeaders.ContentDisposition, "filename=\"$filename\"")
-                    if (mimeType != null) append(HttpHeaders.ContentType, mimeType)
-                })
-                if (sessionKey != null) append("session_key", sessionKey)
-            },
-        ) {
-            url("${baseUrl.trimEnd('/')}/archive/upload")
+        val uploadUrl = "${baseUrl.trimEnd('/')}/archive/upload"
+        val formData = formData {
+            append("file", bytes, Headers.build {
+                append(HttpHeaders.ContentDisposition, "filename=\"$filename\"")
+                if (mimeType != null) append(HttpHeaders.ContentType, mimeType)
+            })
+            if (sessionKey != null) append("session_key", sessionKey)
+        }
+        val response = httpClient.submitFormWithBinaryData(uploadUrl, formData) {
             if (token.isNotBlank()) header("Authorization", "Bearer $token")
         }
 
@@ -46,7 +45,7 @@ class ArchiveApi(
         val root = GatewayJson.parseToJsonElement(body).jsonObject
         val record = root["record"]?.jsonObject ?: root
         val archiveId = record.string("archive_id") ?: record.string("id")
-            ?: error("Archive upload response is missing archive_id")
+        ?: error("Archive upload response is missing archive_id")
         return ArchiveAttachment(
             archiveId = archiveId,
             filename = record.string("filename") ?: filename,

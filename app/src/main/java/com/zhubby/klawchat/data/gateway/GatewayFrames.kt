@@ -6,6 +6,7 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 
@@ -84,19 +85,19 @@ object GatewayServerFrameDeserializer : DeserializationStrategy<GatewayServerFra
 
         // Result frame: { "id": "...", "result": { ... } }
         if (element.containsKey("result")) {
-            return GatewayJson.decodeFromJsonElement<GatewayServerFrame.Result>(element)
+            return GatewayJson.decodeFromJsonElement(GatewayServerFrame.Result.serializer(), element)
         }
 
         // Error frame: { "id": "...", "error": { "code": "...", "message": "..." } }
         if (element.containsKey("error")) {
-            return GatewayJson.decodeFromJsonElement<GatewayServerFrame.Error>(element)
+            return GatewayJson.decodeFromJsonElement(GatewayServerFrame.Error.serializer(), element)
         }
 
         // Method present → either Notification or ReverseRequest
         if (element.containsKey("method")) {
             val method = element["method"]!!.jsonPrimitive.content
             val params = (element["params"] as? JsonObject) ?: JsonObject(emptyMap())
-            val id = element["id"]?.jsonPrimitive?.contentOrNull
+            val id = element["id"]?.jsonPrimitive?.content
 
             return if (id != null) {
                 GatewayServerFrame.ReverseRequest(id = id, method = method, params = params)

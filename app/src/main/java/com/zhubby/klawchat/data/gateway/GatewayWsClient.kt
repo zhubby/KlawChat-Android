@@ -1,9 +1,11 @@
 package com.zhubby.klawchat.data.gateway
 
 import io.ktor.client.HttpClient
-import io.ktor.client.plugins.websocket.Websockets
+import io.ktor.client.plugins.websocket.WebSockets
 import io.ktor.client.plugins.websocket.ws
 import io.ktor.client.plugins.websocket.wss
+import io.ktor.client.request.header
+import io.ktor.client.request.url
 import io.ktor.websocket.Frame
 import io.ktor.websocket.readText
 import kotlinx.coroutines.CompletableDeferred
@@ -47,7 +49,7 @@ sealed interface GatewayConnectionState {
  */
 class GatewayWsClient(
     private val httpClient: HttpClient = HttpClient {
-        install(Websockets) {
+        install(WebSockets) {
             pingIntervalMillis = 20_000
         }
     },
@@ -93,14 +95,23 @@ class GatewayWsClient(
             runCatching {
                 // Determine ws vs wss based on URL scheme
                 val wsUrl = endpoint.webSocketUrl
-                if (wsUrl.startsWith("wss://")) {
-                    httpClient.wss(urlString = wsUrl) {
+                val isSecure = wsUrl.startsWith("wss://")
+                if (isSecure) {
+                    httpClient.wss(wsUrl, request = {
+                        if (endpoint.token.isNotBlank()) {
+                            header("Authorization", "Bearer ${endpoint.token}")
+                        }
+                    }, block = {
                         handleSession(endpoint)
-                    }
+                    })
                 } else {
-                    httpClient.ws(urlString = wsUrl) {
+                    httpClient.ws(wsUrl, request = {
+                        if (endpoint.token.isNotBlank()) {
+                            header("Authorization", "Bearer ${endpoint.token}")
+                        }
+                    }, block = {
                         handleSession(endpoint)
-                    }
+                    })
                 }
             }.onFailure { error ->
                 if (scope.isActive) {

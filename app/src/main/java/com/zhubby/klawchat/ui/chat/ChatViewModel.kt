@@ -39,7 +39,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             settingsStore.settings.collect { settings ->
                 val connectionChanged = settings.baseUrl != currentSettings.baseUrl ||
-                    settings.token != currentSettings.token
+                        settings.token != currentSettings.token
                 currentSettings = settings
                 _uiState.update { it.copy(streamEnabled = settings.streamEnabled) }
                 if (connectionChanged || uiState.value.connectionStatus == ConnectionStatus.Disconnected) {
@@ -55,14 +55,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             connectionStatus = ConnectionStatus.Connected,
                             statusMessage = "Connected",
                         )
+
                         GatewayConnectionState.Connecting -> it.copy(
                             connectionStatus = ConnectionStatus.Connecting,
                             statusMessage = "Connecting",
                         )
+
                         GatewayConnectionState.Disconnected -> it.copy(
                             connectionStatus = ConnectionStatus.Disconnected,
                             statusMessage = "Disconnected",
                         )
+
                         is GatewayConnectionState.Failed -> it.copy(
                             connectionStatus = ConnectionStatus.Error,
                             statusMessage = state.message,
@@ -300,7 +303,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             // v1: item completed (includes assistant message finalization)
             "item/completed" -> {
                 val item = params["item"]?.let { it as? kotlinx.serialization.json.JsonObject }
-                val message = (params + (item ?: emptyMap())).chatMessage(
+                val merged = if (item != null) {
+                    kotlinx.serialization.json.buildJsonObject {
+                        params.forEach { (k, v) -> put(k, v) }
+                        item.forEach { (k, v) -> put(k, v) }
+                    }
+                } else {
+                    params
+                }
+                val message = merged.chatMessage(
                     fallbackSessionKey = params.string("session_id"),
                 )
                 logParsedMessage(event.method, params, message)

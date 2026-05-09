@@ -35,14 +35,14 @@ class ChatRepository(
     suspend fun listProviders(): ProviderCatalog {
         val result = wsClient.sendAndWaitResult("provider/list")
         return runCatching {
-            GatewayJson.decodeFromJsonElement<ProviderCatalog>(result)
+            GatewayJson.decodeFromJsonElement(ProviderCatalog.serializer(), result)
         }.getOrDefault(ProviderCatalog())
     }
 
     suspend fun createSession(): WorkspaceSession {
         val result = wsClient.sendAndWaitResult("session/create").jsonObject
         val payload = result["session"]?.jsonObject ?: result
-        return GatewayJson.decodeFromJsonElement<WorkspaceSession>(payload)
+        return GatewayJson.decodeFromJsonElement(WorkspaceSession.serializer(), payload)
     }
 
     suspend fun updateSession(
@@ -112,11 +112,13 @@ class ChatRepository(
         val contentBlocks = mutableListOf<ContentBlock>()
         contentBlocks.add(ContentBlock(type = "text", text = input))
         for (attachment in attachments) {
-            contentBlocks.add(ContentBlock(
-                type = "attachment",
-                archiveId = attachment.archiveId,
-                filename = attachment.filename,
-            ))
+            contentBlocks.add(
+                ContentBlock(
+                    type = "attachment",
+                    archiveId = attachment.archiveId,
+                    filename = attachment.filename,
+                )
+            )
         }
         val params = buildJsonObject {
             put("session_id", sessionKey)

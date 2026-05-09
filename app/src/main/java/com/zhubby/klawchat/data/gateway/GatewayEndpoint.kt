@@ -7,13 +7,16 @@ data class GatewayEndpoint(
     val webSocketUrl: String
         get() {
             val url = baseUrl.trimEnd('/')
-            val wsBase = when {
-                url.startsWith("https://") -> url.replaceFirst("https://", "wss://")
-                url.startsWith("http://") -> url.replaceFirst("http://", "ws://")
-                else -> "ws://$url"
+            // Determine scheme and strip any existing path to set /ws/chat
+            val (scheme, hostPort) = when {
+                url.startsWith("https://") -> "wss" to url.removePrefix("https://")
+                url.startsWith("http://") -> "ws" to url.removePrefix("http://")
+                else -> "ws" to url
             }
+            // Remove any existing path from hostPort (keep host:port only)
+            val hostOnly = hostPort.substringBefore('/')
             val query = if (token.isNotBlank()) "?token=${encodeQueryParam(token)}" else ""
-            return "$wsBase/ws/chat$query"
+            return "$scheme://$hostOnly/ws/chat$query"
         }
 
     val httpBaseUrl: String
