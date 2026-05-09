@@ -139,13 +139,21 @@ fun JsonObject.chatMessage(fallbackSessionKey: String? = null): ChatMessage? {
     // Legacy: response object (flat or nested)
     val responseObj = this["response"]?.objectOrNull() ?: messageObj?.get("response")?.objectOrNull()
     val sessionKey = string("session_key")
+        ?: string("session_id")
         ?: itemObj?.string("session_key")
+        ?: itemObj?.string("session_id")
         ?: itemPayload?.string("session_key")
         ?: messageObj?.string("session_key")
         ?: responseObj?.string("session_key")
         ?: fallbackSessionKey
         ?: return null
+    val itemType = itemObj?.string("type")
     val role = string("role")
+        ?: when (itemType) {
+            "userMessage" -> "user"
+            "agentMessage" -> "assistant"
+            else -> null
+        }
         ?: itemPayload?.string("role")
         ?: messageObj?.string("role")
         ?: responseObj?.string("role")

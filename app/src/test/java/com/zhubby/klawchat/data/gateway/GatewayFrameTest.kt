@@ -7,14 +7,16 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class GatewayFrameTest {
-    private val json = Json {
-        ignoreUnknownKeys = true
-        explicitNulls = false
-    }
+    private val json = Json { ignoreUnknownKeys = true; explicitNulls = false }
+
+    // ── Client request frame encoding ──
 
     @Test
     fun encodesClientRequestFrameWithParams() {
@@ -33,6 +35,37 @@ class GatewayFrameTest {
     }
 
     @Test
+    fun encodesClientRequestFrameWithEmptyParams() {
+        val frame = GatewayClientRequest(
+            id = "create_1",
+            method = "session/create",
+        )
+
+        val encoded = GatewayJson.encodeToString(GatewayClientRequest.serializer(), frame)
+        val decoded = GatewayJson.decodeFromString(GatewayClientRequest.serializer(), encoded)
+
+        assertEquals("create_1", decoded.id)
+        assertEquals("session/create", decoded.method)
+        // params defaults to empty JsonObject; round-trip preserves it
+    }
+
+    @Test
+    fun encodesClientRequestProducesValidV1Envelope() {
+        val frame = GatewayClientRequest(
+            id = "init_1",
+            method = "initialize",
+            params = buildJsonObject { put("client_info", buildJsonObject { put("name", "test") }) },
+        )
+
+        val encoded = GatewayJson.encodeToString(GatewayClientRequest.serializer(), frame)
+        // v1: no "type" field, no "jsonrpc" field
+        assertFalse(json.parseToJsonElement(encoded).jsonObject.containsKey("type"))
+        assertFalse(json.parseToJsonElement(encoded).jsonObject.containsKey("jsonrpc"))
+    }
+
+    // ── Client notification frame encoding ──
+
+    @Test
     fun encodesClientNotificationFrameWithoutId() {
         val frame = GatewayClientNotification(
             method = "initialized",
@@ -43,9 +76,24 @@ class GatewayFrameTest {
         val tree = json.parseToJsonElement(encoded).jsonObject
 
         assertTrue(tree.containsKey("method"))
-        assertTrue(!tree.containsKey("id"))
+        assertFalse(tree.containsKey("id"))
         assertEquals("initialized", tree["method"]?.toString()?.trim('"'))
     }
+
+    @Test
+    fun encodesClientNotificationWithParams() {
+        val frame = GatewayClientNotification(
+            method = "initialized",
+            params = buildJsonObject { put("protocol_version", "v1") },
+        )
+
+        val encoded = GatewayJson.encodeToString(GatewayClientNotification.serializer(), frame)
+        val tree = json.parseToJsonElement(encoded).jsonObject
+
+        assertEquals("v1", tree["params"]?.jsonObject?.get("protocol_version")?.toString()?.trim('"'))
+    }
+
+    // ── Server frame deserialization ──
 
     @Test
     fun decodesResultFrame() {
@@ -60,6 +108,19 @@ class GatewayFrameTest {
     }
 
     @Test
+    fun decodesResultFrameWithNestedObject() {
+        val decoded = GatewayJson.decodeFromString(
+            GatewayServerFrameDeserializer,
+            """{"id":"sessions_1","result":{"sessions":[{"session_key":"ws:abc"}],"active_session_key":"ws:abc"}}""",
+        )
+
+        assertTrue(decoded is GatewayServerFrame.Result)
+        val result = decoded as GatewayServerFrame.Result
+        assertEquals("sessions_1", result.id)
+        assertNotNull(result.result)
+    }
+
+    @Test
     fun decodesErrorFrame() {
         val decoded = GatewayJson.decodeFromString(
             GatewayServerFrameDeserializer,
@@ -70,6 +131,33 @@ class GatewayFrameTest {
         val error = decoded as GatewayServerFrame.Error
         assertEquals("42", error.id)
         assertEquals("invalid_params", error.error.code)
+        assertEquals("bad input", error.error.message)
+    }
+
+    @Test
+    fun decodesErrorFrameWithNullId() {
+        val decoded = GatewayJson.decodeFromString(
+            GatewayServerFrameDeserializer,
+            """{"id":null,"error":{"code":"invalid_request","message":"parse error"}}""",
+        )
+
+        assertTrue(decoded is GatewayServerFrame.Error)
+        val error = decoded as GatewayServerFrame.Error
+        assertNull(error.id)
+        assertEquals("invalid_request", error.error.code)
+    }
+
+    @Test
+    fun decodesErrorFrameWithData() {
+        val decoded = GatewayJson.decodeFromString(
+            GatewayServerFrameDeserializer,
+            """{"id":"turn_req_1","error":{"code":"too_many_active_turns","message":"too many turns","data":{"max_active_turns":4,"retryable":true}}}""",
+        )
+
+        assertTrue(decoded is GatewayServerFrame.Error)
+        val error = decoded as GatewayServerFrame.Error
+        assertEquals("too_many_active_turns", error.error.code)
+        assertNotNull(error.error.data)
     }
 
     @Test
@@ -86,6 +174,32 @@ class GatewayFrameTest {
     }
 
     @Test
+    fun decodesNotificationFrameWithEmptyParams() {
+        val decoded = GatewayJson.decodeFromString(
+            GatewayServerFrameDeserializer,
+            """{"method":"session/subscribed"}""",
+        )
+
+        assertTrue(decoded is GatewayServerFrame.Notification)
+        val notification = decoded as GatewayServerFrame.Notification
+        assertEquals("session/subscribed", notification.method)
+        assertTrue(notification.params.isEmpty())
+    }
+
+    @Test
+    fun decodesNotificationFrameWithMissingParamsKey() {
+        val decoded = GatewayJson.decodeFromString(
+            GatewayServerFrameDeserializer,
+            """{"method":"initialized"}""",
+        )
+
+        assertTrue(decoded is GatewayServerFrame.Notification)
+        val notification = decoded as GatewayServerFrame.Notification
+        assertEquals("initialized", notification.method)
+        assertTrue(notification.params.isEmpty())
+    }
+
+    @Test
     fun decodesReverseRequestFrame() {
         val decoded = GatewayJson.decodeFromString(
             GatewayServerFrameDeserializer,
@@ -97,6 +211,67 @@ class GatewayFrameTest {
         assertEquals("srv_1", request.id)
         assertEquals("approval/request", request.method)
     }
+
+    @Test
+    fun decodesReverseRequestToolRequestUserInput() {
+        val decoded = GatewayJson.decodeFromString(
+            GatewayServerFrameDeserializer,
+            """{"id":"srv_2","method":"tool/requestUserInput","params":{"prompt":"Enter value"}}""",
+        )
+
+        assertTrue(decoded is GatewayServerFrame.ReverseRequest)
+        val request = decoded as GatewayServerFrame.ReverseRequest
+        assertEquals("srv_2", request.id)
+        assertEquals("tool/requestUserInput", request.method)
+    }
+
+    @Test
+    fun decodesResultWinsOverMethodWhenBothPresent() {
+        // A response with result field — result takes precedence over method detection
+        val decoded = GatewayJson.decodeFromString(
+            GatewayServerFrameDeserializer,
+            """{"id":"42","method":"session/list","result":{"sessions":[]}}""",
+        )
+
+        assertTrue(decoded is GatewayServerFrame.Result)
+    }
+
+    @Test
+    fun decodesErrorWinsOverMethodWhenBothPresent() {
+        val decoded = GatewayJson.decodeFromString(
+            GatewayServerFrameDeserializer,
+            """{"id":"42","method":"turn/start","error":{"code":"too_many_active_turns","message":"exceeded"}}""",
+        )
+
+        assertTrue(decoded is GatewayServerFrame.Error)
+    }
+
+    @Test
+    fun decodesUnrecognizedFrameAsError() {
+        val decoded = GatewayJson.decodeFromString(
+            GatewayServerFrameDeserializer,
+            """{"unknown_field":"value"}""",
+        )
+
+        assertTrue(decoded is GatewayServerFrame.Error)
+        val error = decoded as GatewayServerFrame.Error
+        assertEquals("invalid_request", error.error.code)
+    }
+
+    // ── GatewayError ──
+
+    @Test
+    fun deserializesGatewayError() {
+        val error = GatewayJson.decodeFromString(
+            GatewayError.serializer(),
+            """{"code":"method_not_found","message":"method not found","data":{"available":["session/list","provider/list"]}}"""
+        )
+        assertEquals("method_not_found", error.code)
+        assertEquals("method not found", error.message)
+        assertNotNull(error.data)
+    }
+
+    // ── chatMessage() parsing (v1 + legacy) ──
 
     @Test
     fun parsesMessageAttachmentsFromPayload() {
@@ -199,7 +374,7 @@ class GatewayFrameTest {
         val history = result.historyResult()
 
         assertEquals("older message", history.messages.single().content)
-        assertEquals(true, history.hasMore)
+        assertTrue(history.hasMore)
         assertEquals("message-1", history.oldestLoadedMessageId)
     }
 
